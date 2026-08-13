@@ -1,0 +1,38 @@
+name = "QLDPC"
+uuid = "9c9d2c0e-fc67-404e-a1d1-f48da30a9788"
+version = "0.1.0"
+authors = ["Aaron Trowbridge <aaron@harmoniqs.co> and contributors"]
+
+[deps]
+JLD2 = "033835bb-8acc-5ee8-8aae-3f567f8a3819"
+JSON = "682c06a0-de6a-54ab-a142-c8b1cf79cde6"
+LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
+Reexport = "189a3867-3050-52da-a836-e630ba90ab69"
+SHA = "ea8e919c-243c-51af-8825-aaa63cd721ce"
+SparseArrays = "2f01184e-e22b-5df5-ae63-d93ebab69eaf"
+TestItemRunner = "f8b46487-2199-4994-9208-9a1283c18c0a"
+TestItems = "1c621080-faea-4a02-84b6-bbd5e436b8fe"
+
+[compat]
+Aqua = "0.8"
+JLD2 = "0.6"
+JET = "0.9, 0.10, 0.11"
+JSON = "1"
+LinearAlgebra = "1.10, 1.11, 1.12"
+Random = "1.10, 1.11, 1.12"
+Reexport = "1.2"
+SHA = "0.7"
+SparseArrays = "1.10, 1.11, 1.12"
+TestItemRunner = "1.1"
+TestItems = "1.0"
+Test = "1"
+julia = "1.10, 1.11, 1.12"
+
+[extras]
+Aqua = "4c88cf16-eb10-579e-8560-4a9242c79595"
+JET = "c3a54625-cd67-489e-a8e7-0a5a0ff4e31b"
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Aqua", "JET", "Test"]

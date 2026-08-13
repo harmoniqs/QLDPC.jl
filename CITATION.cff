@@ -1,0 +1,16 @@
+cff-version: 1.2.0
+title: QLDPC.jl
+message: >-
+  If you use this software, please cite it using the
+  metadata from this file.
+type: software
+authors:
+  - given-names: Aaron
+    family-names: Trowbridge
+    email: aaron@harmoniqs.co
+    affiliation: Harmoniqs
+repository-code: 'https://github.com/harmoniqs/QLDPC.jl'
+abstract: >-
+  Julia toolkit for qLDPC codes — BB, CSS, distance, search, validation
+  (challenge kit). Mirrors research/kit in Julia with SparseArrays.
+license: MIT
