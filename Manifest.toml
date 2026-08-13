@@ -2,7 +2,7 @@
 
 julia_version = "1.12.5"
 manifest_format = "2.0"
-project_hash = "4ca2bed3f66aa8f305f7fa8f57b14d9997effe35"
+project_hash = "de9833fa18b37ec1911cc517bdd7da59b115df3b"
 
 [[deps.ArgTools]]
 uuid = "0dad84c5-d112-42e6-8d28-ef12dabb789f"
@@ -223,6 +223,12 @@ deps = ["JLD2", "JSON", "LinearAlgebra", "Random", "Reexport", "SHA", "SparseArr
 path = "."
 uuid = "9c9d2c0e-fc67-404e-a1d1-f48da30a9788"
 version = "0.1.0"
+
+    [deps.QLDPC.extensions]
+    QLDPCNemoExt = "Nemo"
+
+    [deps.QLDPC.weakdeps]
+    Nemo = "2edaba10-b0f1-5616-af89-8c11ac63239a"
 
 [[deps.Random]]
 deps = ["SHA"]

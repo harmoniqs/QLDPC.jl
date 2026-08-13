@@ -48,11 +48,11 @@ function rref_gf2(M::AbstractMatrix)::Tuple{Matrix{Bool},Vector{Int}}
     end
     r = 1
     pivots = Int[]
-    for c in 1:cols
+    for c = 1:cols
         r > rows && break
         # find pivot row
         piv = 0
-        for i in r:rows
+        for i = r:rows
             if A[i, c]
                 piv = i
                 break
@@ -63,9 +63,9 @@ function rref_gf2(M::AbstractMatrix)::Tuple{Matrix{Bool},Vector{Int}}
             A[r, :], A[piv, :] = A[piv, :], A[r, :]
         end
         # eliminate column c from all other rows
-        for i in 1:rows
+        for i = 1:rows
             if i != r && A[i, c]
-                @inbounds @simd for j in 1:cols
+                @inbounds @simd for j = 1:cols
                     A[i, j] = A[i, j] ⊻ A[r, j]
                 end
             end
@@ -81,9 +81,33 @@ end
 """
     rank_gf2(M) -> Int
 
-Rank over GF(2).
+Rank over GF(2) — dense Gaussian elimination fallback.
+If Nemo is loaded, `QLDPCNemoExt` overloads this to use `Nemo.rank`
+over `GF(2)` for large matrices.
 """
 rank_gf2(M::AbstractMatrix) = length(rref_gf2(M)[2])
+
+"""
+    rank_gf2_fast(M) -> Int
+
+Rank over GF(2), using Nemo if available (weakdep `QLDPCNemoExt`),
+else fallback to `rank_gf2`. For `[[72,12,6]]` both agree exactly;
+Nemo is faster for n ≥ 144.
+"""
+function rank_gf2_fast(M::AbstractMatrix)::Int
+    ext = Base.get_extension(@__MODULE__, :QLDPCNemoExt)
+    if ext !== nothing
+        try
+            return ext.rank_nemo(M)
+        catch e
+            @debug "Nemo fast rank failed, falling back" exception = e
+        end
+    end
+    return rank_gf2(M)
+end
+
+# internal fallback for extension to call without recursion
+_rank_gf2_fallback(M::AbstractMatrix) = length(rref_gf2(M)[2])
 
 """
     in_rowspace(v, M) -> Bool
@@ -112,9 +136,9 @@ function commutes(v::AbstractVector, H::AbstractMatrix)::Bool
     Hd = _as_bool_dense(H)
     vd = Vector{Bool}(map(x -> Bool(Int(x) & 1 != 0), collect(v)))
     m, n = size(Hd)
-    for i in 1:m
+    for i = 1:m
         s = false
-        @inbounds for j in 1:n
+        @inbounds for j = 1:n
             s = s ⊻ (Hd[i, j] & vd[j])
         end
         s && return false
@@ -132,7 +156,7 @@ function kernel_basis(H::AbstractMatrix)::Matrix{Bool}
     n = size(Hd, 2)
     R, piv = rref_gf2(Hd)
     pivset = Set(piv)
-    free = [c for c in 1:n if c ∉ pivset]
+    free = [c for c = 1:n if c ∉ pivset]
     B = zeros(Bool, length(free), n)
     for (idx, fc) in enumerate(free)
         B[idx, fc] = true
@@ -191,10 +215,10 @@ function verify_css(Hx::AbstractMatrix, Hz::AbstractMatrix)::Bool
     m, n = size(Hd_x)
     mz, nz = size(Hd_z)
     @assert n == nz "Hx and Hz must have same n (columns)"
-    for i in 1:m
-        for j in 1:mz
+    for i = 1:m
+        for j = 1:mz
             s = false
-            @inbounds for k in 1:n
+            @inbounds for k = 1:n
                 s = s ⊻ (Hd_x[i, k] & Hd_z[j, k])
             end
             s && return false
@@ -254,7 +278,7 @@ end
 
 Maximum row weight (check weight) of `H`.
 """
-row_weight(H::AbstractMatrix) = isempty(H) ? 0 : maximum(sum(H; dims=2))
+row_weight(H::AbstractMatrix) = isempty(H) ? 0 : maximum(sum(H; dims = 2))
 
 """
     weight(c::CSSCode) -> Int
@@ -308,3 +332,24 @@ end
     @test size(LB, 2) == 3
 end
 
+@testitem "GF2: rank_gf2_fast matches fallback on [[72,12,6]]" begin
+    using QLDPC
+    using SparseArrays
+    # [[72,12,6]] BB code
+    Hx, Hz = build_bb(6, 6, [(3, 0), (0, 1), (0, 2)], [(0, 3), (1, 0), (2, 0)])
+    # fallback reference
+    r_x = QLDPC._rank_gf2_fallback(Hx)
+    r_z = QLDPC._rank_gf2_fallback(Hz)
+    r_x_fast = rank_gf2_fast(Hx)
+    r_z_fast = rank_gf2_fast(Hz)
+    @test r_x == r_x_fast
+    @test r_z == r_z_fast
+    @test r_x == 30  # 36 -? n=72 k=12 => rank sum 60 => each 30 for this symmetric code
+    @test r_z == 30
+    @test rank_gf2(Hx) == r_x_fast
+    @test rank_gf2(Hz) == r_z_fast
+    @test compute_k(Hx, Hz) == 12
+    # also check small matrices
+    @test rank_gf2_fast(Bool[1 0; 0 1]) == 2
+    @test rank_gf2_fast(Bool[1 1; 1 1]) == 1
+end

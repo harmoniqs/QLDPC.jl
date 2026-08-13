@@ -35,7 +35,7 @@ function _rref_perm(M::Matrix{Bool}, perm::Vector{Int})::Matrix{Bool}
         r > rows && break
         # find pivot row >= r with A[row,col]==1
         piv = 0
-        for i in r:rows
+        for i = r:rows
             if A[i, col]
                 piv = i
                 break
@@ -46,9 +46,9 @@ function _rref_perm(M::Matrix{Bool}, perm::Vector{Int})::Matrix{Bool}
             A[r, :], A[piv, :] = A[piv, :], A[r, :]
         end
         # eliminate column col from all other rows
-        for i in 1:rows
+        for i = 1:rows
             if i != r && A[i, col]
-                @inbounds @simd for j in 1:cols
+                @inbounds @simd for j = 1:cols
                     A[i, j] = A[i, j] ⊻ A[r, j]
                 end
             end
@@ -57,12 +57,12 @@ function _rref_perm(M::Matrix{Bool}, perm::Vector{Int})::Matrix{Bool}
     end
     # return only nonzero rows (up to r-1) — but keep rows that may be zero after elimination
     # filter zero rows
-    keep = [i for i in 1:size(A,1) if any(A[i, :])]
+    keep = [i for i = 1:size(A, 1) if any(A[i, :])]
     return A[keep, :]
 end
 
 function _weights_rows(M::Matrix{Bool})::Vector{Int}
-    return vec(sum(M; dims=2))
+    return vec(sum(M; dims = 2))
 end
 
 # ---------------------------------------------------------------------------
@@ -81,12 +81,12 @@ no logical exists (k=0 side).
 function _search_lightest(
     Hself::AbstractMatrix,
     Hopp::AbstractMatrix;
-    trials::Int=400,
-    seed::Int=0,
-    pair_depth::Int=10,
+    trials::Int = 400,
+    seed::Int = 0,
+    pair_depth::Int = 10,
 )::Tuple{Int,Vector{Int}}
     Hself_b = Matrix{Bool}(map(x -> Bool(Int(x) & 1 != 0), collect(Hself)))
-    Hopp_b  = Matrix{Bool}(map(x -> Bool(Int(x) & 1 != 0), collect(Hopp)))
+    Hopp_b = Matrix{Bool}(map(x -> Bool(Int(x) & 1 != 0), collect(Hopp)))
     n = size(Hself_b, 2)
 
     K = kernel_basis(Hopp_b)          # operators commuting with opposite checks
@@ -101,7 +101,7 @@ function _search_lightest(
 
     # Pre-convert LO to Matrix{Bool} for fast check: v is nontrivial iff (v * LO' mod2) != 0
     # i.e. v anticommutes with at least one opposite-type logical
-    for _ in 1:trials
+    for _ = 1:trials
         perm = randperm(rng, n)
         red = _rref_perm(K, perm)
         if size(red, 1) == 0
@@ -125,17 +125,17 @@ function _search_lightest(
             light = order[1:take]
             sub = red[light, :]
             # pairwise sums (i < j)
-            for i in 1:take
-                for j in i+1:take
+            for i = 1:take
+                for j = i+1:take
                     pr = sub[i, :] .⊻ sub[j, :]
                     pw = count(identity, pr)
                     pw == 0 && continue
                     # nontrivial?
                     # check pr * LO' mod2
                     is_nz = false
-                    for r in 1:size(LO, 1)
+                    for r = 1:size(LO, 1)
                         s = false
-                        @inbounds for c in 1:n
+                        @inbounds for c = 1:n
                             s = s ⊻ (pr[c] & LO[r, c])
                         end
                         if s
@@ -164,10 +164,10 @@ function _nontrivial_mask(R::Matrix{Bool}, LO::Matrix{Bool})::Vector{Bool}
     r, n = size(R)
     l = size(LO, 1)
     mask = falses(r)
-    for i in 1:r
-        for j in 1:l
+    for i = 1:r
+        for j = 1:l
             s = false
-            @inbounds for c in 1:n
+            @inbounds for c = 1:n
                 s = s ⊻ (R[i, c] & LO[j, c])
             end
             if s
@@ -189,10 +189,10 @@ if no logical exists.
 function lightest_logical(
     Hself::AbstractMatrix,
     Hopp::AbstractMatrix;
-    trials::Int=8000,
-    seed::Int=0,
+    trials::Int = 8000,
+    seed::Int = 0,
 )::Tuple{Int,Vector{Int}}
-    return _search_lightest(Hself, Hopp; trials=trials, seed=seed)
+    return _search_lightest(Hself, Hopp; trials = trials, seed = seed)
 end
 
 """
@@ -204,20 +204,21 @@ no logical qubits (`k==0`).
 function distance_rand(
     Hx::AbstractMatrix,
     Hz::AbstractMatrix;
-    trials::Int=2000,
-    seed::Int=0,
+    trials::Int = 2000,
+    seed::Int = 0,
 )::Int
-    wx, _ = _search_lightest(Hx, Hz; trials=trials, seed=seed)
-    wz, _ = _search_lightest(Hz, Hx; trials=trials, seed=seed + 1)
+    wx, _ = _search_lightest(Hx, Hz; trials = trials, seed = seed)
+    wz, _ = _search_lightest(Hz, Hx; trials = trials, seed = seed + 1)
     d = min(wx, wz)
     return d
 end
 
 # Convenience for CSSCode
-distance_rand(c::CSSCode; trials::Int=400, seed::Int=0) = distance_rand(c.Hx, c.Hz; trials=trials, seed=seed)
-lightest_logical(c::CSSCode, side::Symbol=:X; trials::Int=8000, seed::Int=0) =
-    side == :X ? lightest_logical(c.Hx, c.Hz; trials=trials, seed=seed) :
-    side == :Z ? lightest_logical(c.Hz, c.Hx; trials=trials, seed=seed) :
+distance_rand(c::CSSCode; trials::Int = 400, seed::Int = 0) =
+    distance_rand(c.Hx, c.Hz; trials = trials, seed = seed)
+lightest_logical(c::CSSCode, side::Symbol = :X; trials::Int = 8000, seed::Int = 0) =
+    side == :X ? lightest_logical(c.Hx, c.Hz; trials = trials, seed = seed) :
+    side == :Z ? lightest_logical(c.Hz, c.Hx; trials = trials, seed = seed) :
     error("side must be :X or :Z")
 
 using TestItems
@@ -226,17 +227,17 @@ using TestItems
     Hx = sparse(Bool[1 1])
     Hz = spzeros(Bool, 0, 2)
     # Hx rank 1, Hz rank 0, n=2 => k=1, but d should be finite via search
-    d = distance_rand(Hx, Hz; trials=20, seed=0)
+    d = distance_rand(Hx, Hz; trials = 20, seed = 0)
     @test d isa Int
 end
 
 @testitem "surrogate: BB 72,12,6 d upper bound ≤ 6" begin
     Hx, Hz = build_bb(6, 6, [(3, 0), (0, 1), (0, 2)], [(0, 3), (1, 0), (2, 0)])
-    d = distance_rand(Hx, Hz; trials=400, seed=0)
+    d = distance_rand(Hx, Hz; trials = 400, seed = 0)
     # d_rand is an upper bound; Bravyi says d=6, so we expect ≤8 with few trials
     @test d <= 10
     @test d >= 1
-    wx, sx = lightest_logical(Hx, Hz; trials=200, seed=0)
+    wx, sx = lightest_logical(Hx, Hz; trials = 200, seed = 0)
     # witness must commute with Hz and not be in rowspace(Hx) if k>0
     if wx != typemax(Int)
         v = zeros(Bool, 72)
@@ -246,4 +247,3 @@ end
         @test length(sx) == wx
     end
 end
-

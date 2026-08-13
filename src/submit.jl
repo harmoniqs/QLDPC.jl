@@ -30,15 +30,15 @@ function make_submission(
     Hz::AbstractMatrix;
     name::String,
     construction::String,
-    authors::Vector{String}=String[],
-    family::String="bivariate_bicycle",
-    references::Vector{String}=String[],
-    confidence::String="upper_bound",
-    logical_supports::Union{Nothing,Vector{Vector{Int}}}=nothing,
-    trials::Int=400,
-    seed::Int=0,
-    coordinates=nothing,
-    layers::Int=1,
+    authors::Vector{String} = String[],
+    family::String = "bivariate_bicycle",
+    references::Vector{String} = String[],
+    confidence::String = "upper_bound",
+    logical_supports::Union{Nothing,Vector{Vector{Int}}} = nothing,
+    trials::Int = 400,
+    seed::Int = 0,
+    coordinates = nothing,
+    layers::Int = 1,
 )::Dict{String,Any}
     @assert verify_css(Hx, Hz) "CSS check failed: Hx*Hz' != 0"
     n = size(Hx, 2)
@@ -48,8 +48,8 @@ function make_submission(
     supports = if logical_supports !== nothing
         logical_supports
     elseif k > 0
-        wx, sx = lightest_logical(Hx, Hz; trials=trials, seed=seed)
-        wz, sz = lightest_logical(Hz, Hx; trials=trials, seed=seed+1)
+        wx, sx = lightest_logical(Hx, Hz; trials = trials, seed = seed)
+        wz, sz = lightest_logical(Hz, Hx; trials = trials, seed = seed + 1)
         # convert to 0-based for JSON schema (Python verifier expects 0-based)
         sx0 = [s - 1 for s in sx]
         sz0 = [s - 1 for s in sz]
@@ -71,8 +71,8 @@ function make_submission(
     end
 
     # Hx,Hz as dense Int arrays for JSON (schema expects list of lists)
-    Hx_list = [collect(Int.(Hx[i, :])) for i in 1:size(Hx, 1)]
-    Hz_list = [collect(Int.(Hz[i, :])) for i in 1:size(Hz, 1)]
+    Hx_list = [collect(Int.(Hx[i, :])) for i = 1:size(Hx, 1)]
+    Hz_list = [collect(Int.(Hz[i, :])) for i = 1:size(Hz, 1)]
 
     doc = Dict{String,Any}(
         "name" => name,
@@ -91,10 +91,7 @@ function make_submission(
         ),
     )
     if coordinates !== nothing
-        doc["locality"] = Dict{String,Any}(
-            "coordinates" => coordinates,
-            "layers" => layers,
-        )
+        doc["locality"] = Dict{String,Any}("coordinates" => coordinates, "layers" => layers)
     end
     return doc
 end
@@ -105,7 +102,7 @@ function make_submission(
     construction::String,
     kwargs...,
 )::Dict{String,Any}
-    return make_submission(c.Hx, c.Hz; name=name, construction=construction, kwargs...)
+    return make_submission(c.Hx, c.Hz; name = name, construction = construction, kwargs...)
 end
 
 """
@@ -136,7 +133,7 @@ When Python verifier is available the return mirrors its verdict.
 """
 function validate_candidate(
     doc_or_path::Union{Dict,String};
-    verifier_dir::Union{Nothing,String}=nothing,
+    verifier_dir::Union{Nothing,String} = nothing,
 )::Bool
     doc = doc_or_path isa String ? JSON.parsefile(doc_or_path) : doc_or_path
 
@@ -182,7 +179,9 @@ function validate_candidate(
     # optional Python verifier shell-out
     if verifier_dir !== nothing
         tmp = tempname() * ".json"
-        open(tmp, "w") do io; JSON.print(io, doc, 2); end
+        open(tmp, "w") do io
+            JSON.print(io, doc, 2)
+        end
         cmd = `python3 $(joinpath(verifier_dir, "validate_candidate.py")) $tmp`
         try
             run(cmd)
@@ -198,8 +197,8 @@ function _list_to_bool(rows::AbstractVector)::Matrix{Bool}
     m == 0 && return zeros(Bool, 0, 0)
     n = length(rows[1])
     M = zeros(Bool, m, n)
-    for i in 1:m
-        for j in 1:n
+    for i = 1:m
+        for j = 1:n
             M[i, j] = Bool(rows[i][j] & 1 != 0)
         end
     end
@@ -210,7 +209,16 @@ using TestItems
 
 @testitem "submit: make and validate BB 72" begin
     Hx, Hz = build_bb(6, 6, [(3, 0), (0, 1), (0, 2)], [(0, 3), (1, 0), (2, 0)])
-    doc = make_submission(Hx, Hz; name="test-72", construction="Julia BB test", authors=["Tester"], family="bivariate_bicycle", trials=80, seed=0)
+    doc = make_submission(
+        Hx,
+        Hz;
+        name = "test-72",
+        construction = "Julia BB test",
+        authors = ["Tester"],
+        family = "bivariate_bicycle",
+        trials = 80,
+        seed = 0,
+    )
     @test doc["n"] == 72
     @test doc["k"] == 12
     @test haskey(doc, "distance")
@@ -220,8 +228,7 @@ end
 
 @testitem "submit: k mismatch is caught" begin
     Hx, Hz = build_bb(6, 6, [(3, 0), (0, 1), (0, 2)], [(0, 3), (1, 0), (2, 0)])
-    doc = make_submission(Hx, Hz; name="bad-k", construction="x", trials=40)
+    doc = make_submission(Hx, Hz; name = "bad-k", construction = "x", trials = 40)
     doc["k"] = 999
     @test_throws Exception validate_candidate(doc)
 end
-

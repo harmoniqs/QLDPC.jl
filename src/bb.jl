@@ -32,7 +32,7 @@ function monomial_matrix(l::Int, m::Int, a::Int, b::Int)::SparseMatrixCSC{Bool,I
     I = Vector{Int}(undef, N)
     J = Vector{Int}(undef, N)
     V = fill(true, N)
-    for q in 0:N-1
+    for q = 0:N-1
         i = div(q, m)
         j = mod(q, m)
         p = mod(i + a_mod, l) * m + mod(j + b_mod, m)
@@ -47,7 +47,11 @@ end
 
 Sum (mod 2) of monomials for `terms = [(a,b), ...]`.
 """
-function poly_matrix(l::Int, m::Int, terms::Vector{Tuple{Int,Int}})::SparseMatrixCSC{Bool,Int}
+function poly_matrix(
+    l::Int,
+    m::Int,
+    terms::Vector{Tuple{Int,Int}},
+)::SparseMatrixCSC{Bool,Int}
     N = l * m
     M = spzeros(Bool, N, N)
     for (a, b) in terms
@@ -95,11 +99,16 @@ Bravyi et al. BB records for validation (keys are "[[n,k,d]]").
 Each value is a NamedTuple with l,m,A,B.
 """
 const KNOWN_CODES = Dict{String,NamedTuple}(
-    "[[72,12,6]]"   => (l=6,  m=6,  A=[(3, 0), (0, 1), (0, 2)], B=[(0, 3), (1, 0), (2, 0)]),
-    "[[90,8,10]]"   => (l=15, m=3,  A=[(9, 0), (0, 1), (0, 2)], B=[(0, 0), (2, 0), (7, 0)]),
-    "[[108,8,10]]"  => (l=9,  m=6,  A=[(3, 0), (0, 1), (0, 2)], B=[(0, 3), (1, 0), (2, 0)]),
-    "[[144,12,12]]" => (l=12, m=6,  A=[(3, 0), (0, 1), (0, 2)], B=[(0, 3), (1, 0), (2, 0)]),
-    "[[288,12,18]]" => (l=12, m=12, A=[(3, 0), (0, 2), (0, 7)], B=[(0, 3), (1, 0), (2, 0)]),
+    "[[72,12,6]]" =>
+        (l = 6, m = 6, A = [(3, 0), (0, 1), (0, 2)], B = [(0, 3), (1, 0), (2, 0)]),
+    "[[90,8,10]]" =>
+        (l = 15, m = 3, A = [(9, 0), (0, 1), (0, 2)], B = [(0, 0), (2, 0), (7, 0)]),
+    "[[108,8,10]]" =>
+        (l = 9, m = 6, A = [(3, 0), (0, 1), (0, 2)], B = [(0, 3), (1, 0), (2, 0)]),
+    "[[144,12,12]]" =>
+        (l = 12, m = 6, A = [(3, 0), (0, 1), (0, 2)], B = [(0, 3), (1, 0), (2, 0)]),
+    "[[288,12,18]]" =>
+        (l = 12, m = 12, A = [(3, 0), (0, 2), (0, 7)], B = [(0, 3), (1, 0), (2, 0)]),
 )
 
 using TestItems
@@ -125,4 +134,3 @@ end
     @test verify_css(Hx, Hz)
     @test compute_k(Hx, Hz) == 12
 end
-

@@ -47,13 +47,13 @@ Record shape: `NamedTuple{(:spec,:n,:k,:d,:w,:efficiency,:fingerprint)}`.
 """
 function screen(
     candidates;
-    min_k::Int=1,
-    min_d::Int=1,
-    trials::Int=400,
-    seed::Int=0,
-    metric::Function=efficiency,
-    keep=nothing,
-    verbose::Bool=false,
+    min_k::Int = 1,
+    min_d::Int = 1,
+    trials::Int = 400,
+    seed::Int = 0,
+    metric::Function = efficiency,
+    keep = nothing,
+    verbose::Bool = false,
 )
     seen = Dict{String,NamedTuple}()
     for (spec, Hx, Hz) in candidates
@@ -65,18 +65,18 @@ function screen(
         n = size(Hx, 2)
         # seed per candidate from fingerprint so sweeps are reproducible but diverse
         # use first 8 hex chars as Int
-        fp_seed = seed + parse(Int, fp[1:8]; base=16) % 100000
-        d = distance_rand(Hx, Hz; trials=trials, seed=fp_seed)
+        fp_seed = seed + parse(Int, fp[1:8]; base = 16) % 100000
+        d = distance_rand(Hx, Hz; trials = trials, seed = fp_seed)
         (d == typemax(Int) || d < min_d) && continue
         w = max(row_weight(Hx), row_weight(Hz))
-        eff = round(metric(n, k, d); digits=4)
-        rec = (spec=spec, n=n, k=k, d=d, w=w, efficiency=eff, fingerprint=fp)
+        eff = round(metric(n, k, d); digits = 4)
+        rec = (spec = spec, n = n, k = k, d = d, w = w, efficiency = eff, fingerprint = fp)
         seen[fp] = rec
         if verbose
             @info "candidate" spec n k d eff
         end
     end
-    out = sort(collect(values(seen)); by=r -> r.efficiency, rev=true)
+    out = sort(collect(values(seen)); by = r -> r.efficiency, rev = true)
     if keep !== nothing
         out = out[1:min(keep, length(out))]
     end
@@ -94,13 +94,14 @@ function pareto_frontier(records::AbstractVector)
     for r in records
         dominated = any(
             s !== r &&
-            s.n <= r.n && s.k >= r.k && s.d >= r.d &&
-            (s.n < r.n || s.k > r.k || s.d > r.d)
-            for s in records
+            s.n <= r.n &&
+            s.k >= r.k &&
+            s.d >= r.d &&
+            (s.n < r.n || s.k > r.k || s.d > r.d) for s in records
         )
         !dominated && push!(front, r)
     end
-    return sort(front; by=r -> (r.n, -r.k, -r.d))
+    return sort(front; by = r -> (r.n, -r.k, -r.d))
 end
 
 """
@@ -114,16 +115,16 @@ function sample_bb(
     l::Int,
     m::Int,
     n_samples::Int;
-    weight::Int=6,
-    rng::AbstractRNG=Random.GLOBAL_RNG,
+    weight::Int = 6,
+    rng::AbstractRNG = Random.GLOBAL_RNG,
 )
     @assert weight == 6 "only weight-6 (3+3) random BB implemented; extend for other weights"
     out = Vector{Tuple{Any,SparseMatrixCSC{Bool,Int},SparseMatrixCSC{Bool,Int}}}()
     # keep a small dedup within generator
     seen_fp = Set{String}()
-    for _ in 1:n_samples
+    for _ = 1:n_samples
         # sample 3 distinct (a,b) for A and 3 for B
-        all_terms = [(a, b) for a in 0:l-1 for b in 0:m-1]
+        all_terms = [(a, b) for a = 0:l-1 for b = 0:m-1]
         shuffle!(rng, all_terms)
         A_terms = all_terms[1:3]
         B_terms = all_terms[4:6]
@@ -131,7 +132,13 @@ function sample_bb(
         fp = fingerprint(Hx, Hz)
         fp in seen_fp && continue
         push!(seen_fp, fp)
-        spec = Dict("l" => l, "m" => m, "A_terms" => A_terms, "B_terms" => B_terms, "family" => "bb")
+        spec = Dict(
+            "l" => l,
+            "m" => m,
+            "A_terms" => A_terms,
+            "B_terms" => B_terms,
+            "family" => "bb",
+        )
         push!(out, (spec, Hx, Hz))
     end
     return out
@@ -146,15 +153,15 @@ using TestItems
     @test efficiency(72, 12, 6) ≈ 12 * 36 / 72
     # screen dedup
     cands = [("a", Hx, Hz), ("b", Hx, Hz)]
-    recs = screen(cands; trials=20, seed=0)
+    recs = screen(cands; trials = 20, seed = 0)
     @test length(recs) == 1
 end
 
 @testitem "search: pareto frontier" begin
     recs = [
-        (spec="a", n=72, k=12, d=6, w=6, efficiency=3.0, fingerprint="a"),
-        (spec="b", n=72, k=8, d=6, w=6, efficiency=2.0, fingerprint="b"),
-        (spec="c", n=144, k=12, d=10, w=6, efficiency=8.33, fingerprint="c"),
+        (spec = "a", n = 72, k = 12, d = 6, w = 6, efficiency = 3.0, fingerprint = "a"),
+        (spec = "b", n = 72, k = 8, d = 6, w = 6, efficiency = 2.0, fingerprint = "b"),
+        (spec = "c", n = 144, k = 12, d = 10, w = 6, efficiency = 8.33, fingerprint = "c"),
     ]
     front = pareto_frontier(recs)
     # "b" is dominated by "a" (same n, lower k)
@@ -162,4 +169,3 @@ end
     @test any(r -> r.spec == "a", front)
     @test any(r -> r.spec == "c", front)
 end
-

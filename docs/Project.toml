@@ -1,9 +1,14 @@
 [deps]
+CairoMakie = "13f3f980-e62b-5c42-98c6-ff1f3baf88f0"
 Documenter = "e30172f5-a6a5-5a46-863b-614d45cd2de4"
 Literate = "98b081ad-f1c9-55d3-8b20-4c87d4299306"
 QLDPC = "9c9d2c0e-fc67-404e-a1d1-f48da30a9788"
 
+[sources]
+QLDPC = {path = ".."}
+
 [compat]
+CairoMakie = "0.12, 0.13"
 Documenter = "1"
 Literate = "2"
 julia = "1.10, 1.11, 1.12"

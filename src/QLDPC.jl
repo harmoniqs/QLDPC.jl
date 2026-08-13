@@ -12,7 +12,7 @@ include("search.jl")
 include("submit.jl")
 
 export verify_css, compute_k, CSSCode, ncode, kcode, weight, row_weight
-export rank_gf2, rref_gf2, kernel_basis, logical_basis, in_rowspace, commutes
+export rank_gf2, rank_gf2_fast, rref_gf2, kernel_basis, logical_basis, in_rowspace, commutes
 export build_bb, poly_matrix, monomial_matrix, KNOWN_CODES
 export distance_rand, lightest_logical
 export efficiency, fingerprint, screen, pareto_frontier, sample_bb
