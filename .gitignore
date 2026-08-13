@@ -22,8 +22,6 @@ docs/src/generated/
 docs/src/assets/
 
 # Build artifact for using README as index
-docs/src/index.md
-docs/src/development/contributing.md
 
 # Manifests: track main package Manifest for reproducibility, ignore docs Manifest
 docs/Manifest.toml
