@@ -14,6 +14,7 @@ include("planar.jl")
 include("gb.jl")
 include("surrogate.jl")
 include("search.jl")
+include("decode.jl")
 include("submit.jl")
 include("precompile.jl")
 
@@ -22,7 +23,9 @@ export rank_gf2, rank_gf2_fast, rref_gf2, kernel_basis, logical_basis, in_rowspa
 export build_bb, poly_matrix, monomial_matrix, KNOWN_CODES
 export distance_rand, distance_rand_threaded, lightest_logical, lightest_logical_threaded
 export _search_lightest, _search_lightest_threaded, _search_lightest_distributed
-export efficiency, fingerprint, screen, pareto_frontier, sample_bb
+export efficiency, efficiency_weighted, geometric_efficiency, overhead, weight_class
+export fingerprint, screen, pareto_frontier, pareto_frontier_weighted, sample_bb
+export bp_osd_distance, threshold_estimate, circuit_ler
 export make_submission, save_submission, validate_candidate
 export cyclic_group, cyclic_product, dihedral_group, metacyclic, sym_group, alt_group, perm_group, direct_product
 export perm_matrix, left_regular_rep, right_regular_rep, build_2bga

@@ -19,6 +19,71 @@ Board headline figure `k*d^2 / n`.
 efficiency(n::Int, k::Int, d::Int) = n == 0 ? 0.0 : k * d * d / n
 
 """
+    efficiency_weighted(n, k, d, w; a=1) -> Float64
+
+Weight-aware efficiency `k*d^2 / (n * w^a)`.
+Heavier checks (larger w) are penalized — mirrors the board's weight-class
+tracks where a high-kd² code at w=16 is not equivalent to the same kd² at w=6.
+`a` is the weight exponent (default 1, linear).
+"""
+function efficiency_weighted(n::Int, k::Int, d::Int, w::Int; a::Real = 1)::Float64
+    n == 0 && return 0.0
+    w <= 0 && return k * d * d / n
+    return k * d * d / (n * w^a)
+end
+
+# convenience: record-based overload
+efficiency_weighted(r::NamedTuple; a::Real = 1) = efficiency_weighted(r.n, r.k, r.d, r.w; a = a)
+
+"""
+    geometric_efficiency(k, d, n, rho, r) -> Float64
+
+Geometric efficiency `4*k*d^2 / (n * rho^2 * r^4)` — planar figure of merit
+that folds in qubit density rho and interaction radius r.
+Mirrors `qldpc-challenge-jl/src/CSSCode.jl:geometric_efficiency`.
+Returns 0.0 if any denominator is zero.
+"""
+function geometric_efficiency(k::Int, d::Int, n::Int, rho::Real, r::Real)::Float64
+    (n == 0 || rho == 0 || r == 0) && return 0.0
+    return 4 * k * d * d / (n * rho^2 * r^4)
+end
+
+# record-based overload (expects fields k,d,n,rho,r or layout-like)
+function geometric_efficiency(r::NamedTuple, rho::Real, radius::Real)
+    geometric_efficiency(r.k, r.d, r.n, rho, radius)
+end
+
+"""
+    overhead(n, k) -> Float64
+
+Qubit overhead `n/k` — physical per logical.
+Returns `Inf` if `k == 0`.
+"""
+overhead(n::Int, k::Int) = k == 0 ? Inf : n / k
+overhead(r::NamedTuple) = overhead(r.n, r.k)
+
+"""
+    weight_class(w) -> String
+
+Mirrors `verify/qldpc_verify.py:weight_class` logic:
+  w ≤ 4  → "weight-4"
+  w ≤ 6  → "weight-6"
+  w ≤ 8  → "weight-8"
+  else   → "weight-9plus"
+Nested — a weight-4 code also qualifies for the looser caps.
+"""
+function weight_class(w::Int)::String
+    w <= 4 && return "weight-4"
+    w <= 6 && return "weight-6"
+    w <= 8 && return "weight-8"
+    return "weight-9plus"
+end
+
+weight_class(Hx::AbstractMatrix, Hz::AbstractMatrix) = weight_class(max(row_weight(Hx), row_weight(Hz)))
+weight_class(c::CSSCode) = weight_class(c.Hx, c.Hz)
+weight_class(r::NamedTuple) = weight_class(r.w)
+
+"""
     fingerprint(Hx, Hz) -> String
 
 Exact-duplicate key: SHA-256 of the stacked RREFs of Hx and Hz (first 16 hex chars).
@@ -105,6 +170,19 @@ function pareto_frontier(records::AbstractVector)
 end
 
 """
+    pareto_frontier_weighted(records; a=1) -> Vector
+
+Pareto frontier sorted by weight-aware efficiency `kd²/(n*w^a)` (best first).
+Applies the same dominance filter as `pareto_frontier`, then re-sorts by
+`efficiency_weighted` so a lighter-weight code can outrank a heavier one
+with higher raw `kd²/n`.
+"""
+function pareto_frontier_weighted(records::AbstractVector; a::Real = 1)
+    front = pareto_frontier(records)
+    return sort(front; by = r -> efficiency_weighted(r.n, r.k, r.d, r.w; a = a), rev = true)
+end
+
+"""
     sample_bb(l, m, n_samples; weight=6, rng=Random.GLOBAL_RNG) -> Vector
 
 Random BB enumerator: samples `n_samples` random A/B term sets of given weight
@@ -168,4 +246,54 @@ end
     @test length(front) == 2
     @test any(r -> r.spec == "a", front)
     @test any(r -> r.spec == "c", front)
+end
+
+@testitem "search: weight-aware ranking" begin
+    # two known codes: [[360,12,24]] w6 vs [[390,82,32]] w16
+    # raw efficiency: kd^2/n  → 12*576/360=19.2  vs 82*1024/390≈215.3
+    @test efficiency(360, 12, 24) ≈ 19.2 atol=1e-6
+    @test efficiency(390, 82, 32) ≈ 82 * 1024 / 390 atol=1e-6
+    # weighted: kd^2/(n*w^a)
+    @test efficiency_weighted(360, 12, 24, 6; a=1) ≈ 19.2/6 atol=1e-6
+    @test efficiency_weighted(390, 82, 32, 16; a=1) ≈ (82*1024/390)/16 atol=1e-6
+    # a=2 penalizes heavier more — with a=3 the w6 code outranks w16
+    @test efficiency_weighted(360, 12, 24, 6; a=3) > efficiency_weighted(390, 82, 32, 16; a=3)
+    # unweighted: 390 wins; weighted a=3: 360 wins — ranking flips
+    @test efficiency(390, 82, 32) > efficiency(360, 12, 24)
+    @test efficiency_weighted(360, 12, 24, 6; a=3) > efficiency_weighted(390, 82, 32, 16; a=3)
+
+    # overhead
+    @test overhead(360, 12) ≈ 30.0
+    @test overhead(390, 82) ≈ 390/82 atol=1e-9
+    @test overhead(72, 0) == Inf
+
+    # geometric_efficiency: 4*k*d^2/(n*rho^2*r^4)
+    # example: k=12,d=6,n=72,rho=2,r=1.5 → 4*12*36/(72*4*5.0625) = 1728/(1458)=1.185...
+    @test geometric_efficiency(12, 6, 72, 2.0, 1.5) ≈ 4*12*36/(72*4*1.5^4) atol=1e-9
+    @test geometric_efficiency(12, 6, 0, 2.0, 1.5) == 0.0
+    @test geometric_efficiency(12, 6, 72, 0.0, 1.5) == 0.0
+
+    # weight_class mirrors verify/qldpc_verify.py
+    @test weight_class(4) == "weight-4"
+    @test weight_class(5) == "weight-6"
+    @test weight_class(6) == "weight-6"
+    @test weight_class(8) == "weight-8"
+    @test weight_class(9) == "weight-9plus"
+    @test weight_class(16) == "weight-9plus"
+    # from matrices
+    Hx, Hz = build_bb(6, 6, [(3, 0), (0, 1), (0, 2)], [(0, 3), (1, 0), (2, 0)])
+    @test weight_class(Hx, Hz) == "weight-6"
+    @test weight_class(max(row_weight(Hx), row_weight(Hz))) == "weight-6"
+
+    # pareto_frontier_weighted sorts by weighted metric
+    recs = [
+        (spec="w6", n=360, k=12, d=24, w=6, efficiency=19.2, fingerprint="a"),
+        (spec="w16", n=390, k=82, d=32, w=16, efficiency=215.3, fingerprint="b"),
+    ]
+    front_w1 = pareto_frontier_weighted(recs; a=1)
+    @test length(front_w1) == 2
+    # a=1: w16 still outranks w6 on weighted
+    @test front_w1[1].spec == "w16"
+    front_w3 = pareto_frontier_weighted(recs; a=3)
+    @test front_w3[1].spec == "w6"
 end
