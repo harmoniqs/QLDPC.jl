@@ -9,6 +9,9 @@ include("css.jl")
 include("bb.jl")
 include("group_algebra.jl")
 include("coset.jl")
+include("products.jl")
+include("planar.jl")
+include("gb.jl")
 include("surrogate.jl")
 include("search.jl")
 include("submit.jl")
@@ -24,5 +27,10 @@ export make_submission, save_submission, validate_candidate
 export cyclic_group, cyclic_product, dihedral_group, metacyclic, sym_group, alt_group, perm_group, direct_product
 export perm_matrix, left_regular_rep, right_regular_rep, build_2bga
 export subgroup_closure, left_cosets, cosets, normalizer, group_index, group_inverse, inverse, build_coset
+export hypergraph_product, lifted_product, balanced_product, quantum_tanner, random_regular_bipartite
+export sample_hypergraph_product, sample_lifted_product, sample_balanced_product
+export build_planar, build_open_directional, grid_coordinates, graft, planar_radius
+export DEFAULT_F, DEFAULT_G
+export build_gb, gb_divisor_code, gb_divisors, gb_divisors_range, random_gb_pair, enumerate_gb_candidates, k_exact_gb
 
 end
