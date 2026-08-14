@@ -1,0 +1,6 @@
+@import url('https://fonts.googleapis.com/css2?family=Racing+Sans+One&display=swap');
+h1, h2, h3, .docs-sitename, .navbar-brand {
+  font-family: 'Racing Sans One', cursive !important;
+  font-weight: 400;
+  letter-spacing: 0.02em;
+}
