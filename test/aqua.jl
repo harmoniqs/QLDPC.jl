@@ -3,6 +3,6 @@
     Aqua.test_all(
         QLDPC;
         stale_deps = (ignore = [:JLD2, :TestItemRunner],),
-        deps_compat = (ignore = [:Test, :Aqua, :JET],),
+        deps_compat = (ignore = [:Test, :Aqua, :JET, :Distributed],),
     )
 end

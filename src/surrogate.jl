@@ -61,6 +61,30 @@ function _bitset_to_bool(B::Matrix{UInt64}, ncols::Int, keep::Vector{Int})::Matr
     return out
 end
 
+# Single-row bitset -> Vector{Bool} (only for best storage, rare)
+@inline function _bitset_row_to_bool(B::Matrix{UInt64}, row::Int, ncols::Int)::Vector{Bool}
+    out = Vector{Bool}(undef, ncols)
+    @inbounds for c in 1:ncols
+        w = (c - 1) ÷ 64 + 1
+        b = (c - 1) % 64
+        out[c] = ((B[row, w] >> b) & UInt64(1)) == UInt64(1)
+    end
+    return out
+end
+
+# Bitset row -> support indices (for final best_v)
+function _support_from_bits(bits::Vector{UInt64}, ncols::Int)::Vector{Int}
+    supp = Int[]
+    @inbounds for c in 1:ncols
+        w = (c - 1) ÷ 64 + 1
+        b = (c - 1) % 64
+        if ((bits[w] >> b) & UInt64(1)) == UInt64(1)
+            push!(supp, c)
+        end
+    end
+    return supp
+end
+
 """
     rref_bitset!(A, ncols, perm) -> keep::Vector{Int}
 
@@ -156,7 +180,6 @@ function _rref_perm(M::Matrix{Bool}, perm::Vector{Int})::Matrix{Bool}
         # bitset path: pack, run in-place, unpack kept rows
         ncols = size(M, 2)
         B = _bool_to_bitset(M)
-        # reuse is per-call here; allocation-free per-trial reuse happens in _search_lightest
         keep = rref_bitset!(B, ncols, perm)
         return _bitset_to_bool(B, ncols, keep)
     else
@@ -166,6 +189,73 @@ end
 
 function _weights_rows(M::Matrix{Bool})::Vector{Int}
     return vec(sum(M; dims = 2))
+end
+
+# ---------------------------------------------------------------------------
+# Bitset helpers — zero-alloc trial path
+# ---------------------------------------------------------------------------
+
+@inline function _weights_bitset!(wout::Vector{Int}, B::Matrix{UInt64}, keep::Vector{Int}, nwords::Int)
+    @inbounds for idx in 1:length(keep)
+        row = keep[idx]
+        s = 0
+        @inbounds @simd for ww in 1:nwords
+            s += count_ones(B[row, ww])
+        end
+        wout[idx] = s
+    end
+    return wout
+end
+
+function _nontrivial_mask_bitset!(mask::Vector{Bool}, B::Matrix{UInt64}, keep::Vector{Int}, LO_bits::Matrix{UInt64}, nwords::Int)
+    l = size(LO_bits, 1)
+    nk = length(keep)
+    @inbounds for idx in 1:nk
+        row = keep[idx]
+        is_nz = false
+        for j in 1:l
+            parity = 0
+            @inbounds @simd for ww in 1:nwords
+                parity += count_ones(B[row, ww] & LO_bits[j, ww])
+            end
+            if (parity & 1) == 1
+                is_nz = true
+                break
+            end
+        end
+        mask[idx] = is_nz
+    end
+    return mask
+end
+
+# Bitset overload of _nontrivial_mask — parity via count_ones(Rw & LOw) &1
+# Keeps dense fallback dispatch separate; USE_BITSET selects which is called in loops.
+function _nontrivial_mask_bitset(B::Matrix{UInt64}, keep::Vector{Int}, LO_bits::Matrix{UInt64}, nwords::Int)::Vector{Bool}
+    mask = Vector{Bool}(undef, length(keep))
+    _nontrivial_mask_bitset!(mask, B, keep, LO_bits, nwords)
+    return mask
+end
+
+@inline function _popcount_xor_rows(B::Matrix{UInt64}, ri::Int, rj::Int, nwords::Int)::Int
+    s = 0
+    @inbounds @simd for ww in 1:nwords
+        s += count_ones(B[ri, ww] ⊻ B[rj, ww])
+    end
+    return s
+end
+
+@inline function _pairwise_nontrivial_bitset(B::Matrix{UInt64}, ri::Int, rj::Int, LO_bits::Matrix{UInt64}, nwords::Int)::Bool
+    l = size(LO_bits, 1)
+    @inbounds for j in 1:l
+        parity = 0
+        @inbounds @simd for ww in 1:nwords
+            parity += count_ones((B[ri, ww] ⊻ B[rj, ww]) & LO_bits[j, ww])
+        end
+        if (parity & 1) == 1
+            return true
+        end
+    end
+    return false
 end
 
 # ---------------------------------------------------------------------------
@@ -200,88 +290,122 @@ function _search_lightest(
 
     rng = MersenneTwister(seed)
     best_w = n + 1
-    best_v = nothing
 
-    # --- bitset pre-alloc for fast trial loop (allocation-free per trial aside from perm) ---
     use_bitset = USE_BITSET
-    K_bits = use_bitset ? _bool_to_bitset(K) : Matrix{UInt64}(undef, 0, 0)
-    LO_bits = use_bitset ? _bool_to_bitset(LO) : Matrix{UInt64}(undef, 0, 0)
-    nwords = use_bitset ? _nwords(n) : 0
-    work = use_bitset ? Matrix{UInt64}(undef, size(K_bits, 1), nwords) : Matrix{UInt64}(undef, 0, 0)
-    # Pre-allocated perm buffer to avoid randperm alloc per trial (use shuffle!)
-    perm_buf = Vector{Int}(undef, n)
-    for i in 1:n
-        perm_buf[i] = i
-    end
 
-    for _ = 1:trials
-        # ---- generate perm (allocation-free shuffle) ----
-        @inbounds for i in 1:n
-            perm_buf[i] = i
-        end
-        Random.shuffle!(rng, perm_buf)
-        perm = perm_buf  # alias, _rref_perm will read it; no copy
+    if use_bitset
+        # --- bitset zero-alloc trial loop ---
+        K_bits = _bool_to_bitset(K)
+        LO_bits = _bool_to_bitset(LO)
+        nwords = _nwords(n)
+        work = Matrix{UInt64}(undef, size(K_bits, 1), nwords)
+        perm_buf = Vector{Int}(undef, n)
+        for i in 1:n; perm_buf[i]=i; end
 
-        local red::Matrix{Bool}
-        if use_bitset
-            # copy K_bits into work (fast memcopy)
+        max_rows = size(K_bits, 1)
+        wbuf = Vector{Int}(undef, max_rows)
+        maskbuf = Vector{Bool}(undef, max_rows)
+        light_buf = Vector{Int}(undef, max(pair_depth, 1))
+        best_bits = Vector{UInt64}(undef, nwords)
+        found = false
+
+        for _ = 1:trials
+            @inbounds for i in 1:n; perm_buf[i]=i; end
+            Random.shuffle!(rng, perm_buf)
+            perm = perm_buf
+
             copyto!(work, K_bits)
             keep = rref_bitset!(work, n, perm)
-            if isempty(keep)
-                continue
-            end
-            red = _bitset_to_bool(work, n, keep)
-        else
-            red = _rref_perm_dense(K, perm)
-        end
+            nk = length(keep)
+            nk == 0 && continue
 
-        if size(red, 1) == 0
-            continue
-        end
-        w = _weights_rows(red)
-        nz = _nontrivial_mask(red, LO)
-        for i in eachindex(w)
-            if nz[i] && w[i] > 0 && w[i] < best_w
-                best_w = w[i]
-                best_v = Vector{Bool}(red[i, :])
+            _weights_bitset!(wbuf, work, keep, nwords)
+            _nontrivial_mask_bitset!(maskbuf, work, keep, LO_bits, nwords)
+
+            for i in 1:nk
+                if maskbuf[i] && wbuf[i] > 0 && wbuf[i] < best_w
+                    best_w = wbuf[i]
+                    ri = keep[i]
+                    @inbounds for ww in 1:nwords; best_bits[ww]=work[ri, ww]; end
+                    found = true
+                end
             end
-        end
-        # pairwise sums of lightest rows
-        if pair_depth > 1 && size(red, 1) >= 2
-            order = sortperm(w)
-            take = min(pair_depth, length(order))
-            light = order[1:take]
-            sub = red[light, :]
-            for i = 1:take
-                for j = i+1:take
-                    pr = sub[i, :] .⊻ sub[j, :]
-                    pw = count(identity, pr)
-                    pw == 0 && continue
-                    is_nz = false
-                    for r in 1:size(LO, 1)
-                        s = false
-                        @inbounds for c = 1:n
-                            s = s ⊻ (pr[c] & LO[r, c])
+
+            # pairwise sums of lightest rows — zero-alloc selection + XOR popcount
+            if pair_depth > 1 && nk >= 2
+                take = min(pair_depth, nk)
+                # select take smallest indices into light_buf via linear scan (no sortperm alloc)
+                for t in 1:take
+                    best_idx = 0
+                    best_val = typemax(Int)
+                    @inbounds for i in 1:nk
+                        already = false
+                        for q in 1:t-1
+                            if light_buf[q]==i; already=true; break; end
                         end
-                        if s
-                            is_nz = true
-                            break
+                        already && continue
+                        vi = wbuf[i]
+                        if vi < best_val
+                            best_val = vi; best_idx = i
                         end
                     end
-                    if is_nz && pw < best_w
-                        best_w = pw
-                        best_v = Vector{Bool}(pr)
+                    light_buf[t]=best_idx
+                end
+                for ii in 1:take
+                    for jj in ii+1:take
+                        p = light_buf[ii]; q = light_buf[jj]
+                        ri = keep[p]; rj = keep[q]
+                        pw = _popcount_xor_rows(work, ri, rj, nwords)
+                        pw == 0 && continue
+                        pw >= best_w && continue
+                        is_nz = _pairwise_nontrivial_bitset(work, ri, rj, LO_bits, nwords)
+                        if is_nz
+                            best_w = pw
+                            @inbounds for ww in 1:nwords; best_bits[ww]= work[ri, ww] ⊻ work[rj, ww]; end
+                            found = true
+                        end
                     end
                 end
             end
         end
-    end
 
-    if best_v === nothing
-        return typemax(Int), Int[]
+        if !found
+            return typemax(Int), Int[]
+        end
+        supp = _support_from_bits(best_bits, n)
+        sort!(supp)
+        return best_w, supp
+    else
+        # --- dense fallback path (behind USE_BITSET=false for testing) ---
+        best_v = nothing
+        perm_buf = Vector{Int}(undef, n)
+        for i in 1:n; perm_buf[i]=i; end
+        for _ = 1:trials
+            @inbounds for i in 1:n; perm_buf[i]=i; end
+            Random.shuffle!(rng, perm_buf)
+            perm = perm_buf
+            red = _rref_perm_dense(K, perm)
+            if size(red, 1)==0; continue; end
+            w = _weights_rows(red)
+            nz = _nontrivial_mask(red, LO)
+            for i in eachindex(w)
+                if nz[i] && w[i]>0 && w[i] < best_w
+                    best_w=w[i]; best_v=Vector{Bool}(red[i,:])
+                end
+            end
+            if pair_depth>1 && size(red,1)>=2
+                order = sortperm(w); take=min(pair_depth,length(order)); light=order[1:take]; sub=red[light,:]
+                for i=1:take; for j=i+1:take
+                    pr=sub[i,:] .⊻ sub[j,:]; pw=count(identity,pr); pw==0 && continue
+                    is_nz=false; for r in 1:size(LO,1); s=false; @inbounds for c=1:n; s=s ⊻ (pr[c] & LO[r,c]); end; if s; is_nz=true; break; end; end
+                    if is_nz && pw < best_w; best_w=pw; best_v=Vector{Bool}(pr); end
+                end; end
+            end
+        end
+        if best_v===nothing; return typemax(Int), Int[]; end
+        supp=sort(findall(identity,best_v))
+        return best_w,supp
     end
-    supp = sort(findall(identity, best_v))
-    return best_w, supp
 end
 
 # ---------------------------------------------------------------------------
@@ -316,16 +440,12 @@ function _search_lightest_threaded(
     pair_depth::Int = 10,
     nthreads::Int = Threads.nthreads(),
 )::Tuple{Int,Vector{Int}}
-    # Small or single-threaded → serial fallback (no overhead)
     if nthreads <= 1 || Threads.nthreads() == 1
-        # Distributed fallback when no threading but multi-process cluster exists
         if Distributed.nprocs() > 1 && trials >= Distributed.nprocs()
             return _search_lightest_distributed(Hself, Hopp; trials=trials, seed=seed, pair_depth=pair_depth)
         end
         return _search_lightest(Hself, Hopp; trials=trials, seed=seed, pair_depth=pair_depth)
     end
-    # Distributed fallback supersedes threading when explicitly on a cluster with 1 thread per worker
-    # (user can force by passing nthreads==1). Already handled above.
 
     Hself_b = Matrix{Bool}(map(x -> Bool(Int(x) & 1 != 0), collect(Hself)))
     Hopp_b = Matrix{Bool}(map(x -> Bool(Int(x) & 1 != 0), collect(Hopp)))
@@ -337,119 +457,151 @@ function _search_lightest_threaded(
         return typemax(Int), Int[]
     end
 
-    # Pre-generate perms serially with same RNG as serial path → deterministic equality
     rng = MersenneTwister(seed)
     perms = Vector{Vector{Int}}(undef, trials)
     tmp = collect(1:n)
     for t in 1:trials
-        # reset tmp to 1:n is not needed — shuffle! from any permutation is uniform,
-        # but to exactly match serial's refill+shuffle we do refill:
-        @inbounds for i in 1:n
-            tmp[i] = i
-        end
+        @inbounds for i in 1:n; tmp[i]=i; end
         Random.shuffle!(rng, tmp)
         perms[t] = copy(tmp)
     end
 
     use_bitset = USE_BITSET
-    K_bits = use_bitset ? _bool_to_bitset(K) : Matrix{UInt64}(undef, 0, 0)
-    nwords = use_bitset ? _nwords(n) : 0
 
-    # Thread-local work buffers (preallocate Vector{Matrix{UInt64}} per thread)
-    # Use maxthreadid to cover both :default and :interactive pools (Julia 1.11+ may have tid > nthreads())
-    nt_buf = try
-        Threads.nthreads(:default) + Threads.nthreads(:interactive)
-    catch
-        Threads.nthreads()
-    end
-    # also consider Threads.maxthreadid if available
-    try
-        nt_buf = max(nt_buf, Base.Threads.maxthreadid())
-    catch
-    end
-    nt_buf = max(nt_buf, Threads.nthreads(), 16)
-    work_buffers = Vector{Matrix{UInt64}}(undef, nt_buf)
-    for tid in 1:nt_buf
-        work_buffers[tid] = use_bitset ? Matrix{UInt64}(undef, size(K_bits, 1), nwords) : Matrix{UInt64}(undef, 0, 0)
-    end
+    if use_bitset
+        K_bits = _bool_to_bitset(K)
+        LO_bits = _bool_to_bitset(LO)
+        nwords = _nwords(n)
 
-    # Thread-local best state (no atomics needed — each tid owns its slot)
-    nt = Threads.nthreads()
-    # keep reduction over all buf slots to handle interactive-pool tid
-    thread_best_w = fill(n + 1, nt_buf)
-    thread_best_v = Vector{Union{Nothing,Vector{Bool}}}(nothing, nt_buf)
-
-    Threads.@threads for t in 1:trials
-        tid = Threads.threadid()
-        perm = perms[t]
-        local red::Matrix{Bool}
-        if use_bitset
-            work = work_buffers[tid]
-            copyto!(work, K_bits)
-            keep = rref_bitset!(work, n, perm)
-            if isempty(keep)
-                continue
-            end
-            red = _bitset_to_bool(work, n, keep)
-        else
-            red = _rref_perm_dense(K, perm)
+        # Chunk-based parallelism: avoid threadid races; each chunk gets private buffers
+        n_eff = min(nthreads, trials)
+        n_eff = max(1, n_eff)
+        chunk_sz = cld(trials, n_eff)
+        # pre-allocate per-chunk buffers
+        work_buffers = Vector{Matrix{UInt64}}(undef, n_eff)
+        w_buffers = Vector{Vector{Int}}(undef, n_eff)
+        mask_buffers = Vector{Vector{Bool}}(undef, n_eff)
+        light_buffers = Vector{Vector{Int}}(undef, n_eff)
+        best_bits_buffers = Vector{Vector{UInt64}}(undef, n_eff)
+        for cid in 1:n_eff
+            work_buffers[cid] = Matrix{UInt64}(undef, size(K_bits,1), nwords)
+            w_buffers[cid] = Vector{Int}(undef, size(K_bits,1))
+            mask_buffers[cid] = Vector{Bool}(undef, size(K_bits,1))
+            light_buffers[cid] = Vector{Int}(undef, max(pair_depth,1))
+            best_bits_buffers[cid] = zeros(UInt64, nwords)
         end
-        if size(red, 1) == 0
-            continue
-        end
-        w = _weights_rows(red)
-        nz = _nontrivial_mask(red, LO)
+        thread_best_w = fill(n+1, n_eff)
+        thread_found = falses(n_eff)
 
-        # thread-local best (read-modify-write on owned slot, no race)
-        lw = thread_best_w[tid]
-        lv = thread_best_v[tid]
-        for i in eachindex(w)
-            if nz[i] && w[i] > 0 && w[i] < lw
-                lw = w[i]
-                lv = Vector{Bool}(red[i, :])
-            end
-        end
-        if pair_depth > 1 && size(red, 1) >= 2
-            order = sortperm(w)
-            take = min(pair_depth, length(order))
-            light = order[1:take]
-            sub = red[light, :]
-            for i = 1:take
-                for j = i+1:take
-                    pr = sub[i, :] .⊻ sub[j, :]
-                    pw = count(identity, pr)
-                    pw == 0 && continue
-                    is_nz = false
-                    for r in 1:size(LO, 1)
-                        s = false
-                        @inbounds for c = 1:n
-                            s = s ⊻ (pr[c] & LO[r, c])
-                        end
-                        if s
-                            is_nz = true
-                            break
-                        end
+        Threads.@threads for cid in 1:n_eff
+            work = work_buffers[cid]
+            wbuf = w_buffers[cid]
+            maskbuf = mask_buffers[cid]
+            light_buf = light_buffers[cid]
+            best_bits = best_bits_buffers[cid]
+            lw = n+1
+            found_local = false
+            # contiguous chunk of perms for this cid
+            t_start = (cid-1)*chunk_sz + 1
+            t_end = min(cid*chunk_sz, trials)
+            for t in t_start:t_end
+                perm = perms[t]
+                copyto!(work, K_bits)
+                keep = rref_bitset!(work, n, perm)
+                nk = length(keep)
+                nk == 0 && continue
+
+                _weights_bitset!(wbuf, work, keep, nwords)
+                _nontrivial_mask_bitset!(maskbuf, work, keep, LO_bits, nwords)
+
+                for i in 1:nk
+                    if maskbuf[i] && wbuf[i]>0 && wbuf[i] < lw
+                        lw = wbuf[i]
+                        ri = keep[i]
+                        @inbounds for ww in 1:nwords; best_bits[ww]=work[ri, ww]; end
+                        found_local = true
                     end
-                    if is_nz && pw < lw
-                        lw = pw
-                        lv = Vector{Bool}(pr)
+                end
+                if pair_depth>1 && nk>=2
+                    take = min(pair_depth, nk)
+                    for tt in 1:take
+                        best_idx=0; best_val=typemax(Int)
+                        @inbounds for i in 1:nk
+                            already=false
+                            for q in 1:tt-1
+                                if light_buf[q]==i; already=true; break; end
+                            end
+                            already && continue
+                            vi=wbuf[i]
+                            if vi < best_val; best_val=vi; best_idx=i; end
+                        end
+                        light_buf[tt]=best_idx
+                    end
+                    for ii in 1:take
+                        for jj in ii+1:take
+                            p=light_buf[ii]; q=light_buf[jj]
+                            ri=keep[p]; rj=keep[q]
+                            pw=_popcount_xor_rows(work, ri, rj, nwords)
+                            pw==0 && continue
+                            pw >= lw && continue
+                            is_nz=_pairwise_nontrivial_bitset(work, ri, rj, LO_bits, nwords)
+                            if is_nz
+                                lw=pw
+                                @inbounds for ww in 1:nwords; best_bits[ww]=work[ri,ww] ⊻ work[rj,ww]; end
+                                found_local=true
+                            end
+                        end
                     end
                 end
             end
+            thread_best_w[cid]=lw
+            thread_found[cid]=found_local
         end
-        thread_best_w[tid] = lw
-        thread_best_v[tid] = lv
-    end
 
-    # Reduce across threads → global min
-    best_w = minimum(thread_best_w)
-    best_idx = argmin(thread_best_w)
-    best_v = thread_best_v[best_idx]
-    if best_w == n + 1 || best_v === nothing
-        return typemax(Int), Int[]
+        best_w = minimum(thread_best_w)
+        best_idx = argmin(thread_best_w)
+        if best_w==n+1 || !thread_found[best_idx]
+            return typemax(Int), Int[]
+        end
+        supp=_support_from_bits(best_bits_buffers[best_idx], n)
+        sort!(supp)
+        return best_w, supp
+    else
+        # dense fallback for threaded — chunk-based to avoid threadid races
+        n_eff = min(nthreads, trials)
+        n_eff = max(1, n_eff)
+        chunk_sz = cld(trials, n_eff)
+        thread_best_w = fill(n+1, n_eff)
+        thread_best_v = Vector{Union{Nothing,Vector{Bool}}}(nothing, n_eff)
+        Threads.@threads for cid in 1:n_eff
+            lw = n+1
+            lv = nothing
+            t_start = (cid-1)*chunk_sz + 1
+            t_end = min(cid*chunk_sz, trials)
+            for t in t_start:t_end
+                perm=perms[t]
+                red=_rref_perm_dense(K, perm)
+                size(red,1)==0 && continue
+                w=_weights_rows(red); nz=_nontrivial_mask(red, LO)
+                for i in eachindex(w)
+                    if nz[i] && w[i]>0 && w[i] < lw; lw=w[i]; lv=Vector{Bool}(red[i,:]); end
+                end
+                if pair_depth>1 && size(red,1)>=2
+                    order=sortperm(w); take=min(pair_depth,length(order)); light=order[1:take]; sub=red[light,:]
+                    for i=1:take; for j=i+1:take
+                        pr=sub[i,:] .⊻ sub[j,:]; pw=count(identity,pr); pw==0 && continue
+                        is_nz=false; for r in 1:size(LO,1); s=false; @inbounds for c=1:n; s=s ⊻ (pr[c] & LO[r,c]); end; if s; is_nz=true; break; end; end
+                        if is_nz && pw < lw; lw=pw; lv=Vector{Bool}(pr); end
+                    end; end
+                end
+            end
+            thread_best_w[cid]=lw; thread_best_v[cid]=lv
+        end
+        best_w=minimum(thread_best_w); best_idx=argmin(thread_best_w); best_v=thread_best_v[best_idx]
+        if best_w==n+1 || best_v===nothing; return typemax(Int), Int[]; end
+        supp=sort(findall(identity,best_v))
+        return best_w, supp
     end
-    supp = sort(findall(identity, best_v))
-    return best_w, supp
 end
 
 """
@@ -468,13 +620,10 @@ function _search_lightest_distributed(
     pair_depth::Int = 10,
 )::Tuple{Int,Vector{Int}}
     np = Distributed.nprocs()
-    # chunk trials across workers; fall back to serial if tiny
     if np <= 1 || trials < np
         return _search_lightest(Hself, Hopp; trials=trials, seed=seed, pair_depth=pair_depth)
     end
     chunk = cld(trials, np)
-    # Build batch descriptors: (batch_seed, batch_trials, offset) — offset not used for RNG currently
-    # Use consecutive seeds so batches are deterministic and disjoint
     batches = Tuple{Int,Int}[]
     for b in 0:np-1
         start = b * chunk + 1
@@ -584,10 +733,7 @@ function distance_rand_threaded(
     nthreads::Int = Threads.nthreads(),
 )::Int
     if nthreads <= 1 || Threads.nthreads() == 1
-        # Distributed fallback when threading unavailable but cluster present
         if Distributed.nprocs() > 1
-            # pmap over X/Z sides is tiny — better to pmap trials inside each side
-            # _search_lightest_threaded will itself dispatch to distributed branch
             wx, _ = _search_lightest_threaded(Hx, Hz; trials=trials, seed=seed, nthreads=1)
             wz, _ = _search_lightest_threaded(Hz, Hx; trials=trials, seed=seed+1, nthreads=1)
             return min(wx, wz)
@@ -639,19 +785,16 @@ end
     d_serial = distance_rand(Hx, Hz; trials = 400, seed = 0)
     d_thread1 = distance_rand_threaded(Hx, Hz; trials = 400, seed = 0, nthreads = 1)
     @test d_serial == d_thread1
-    # Also check _search_lightest_threaded equality on one side
     w_s, s_s = _search_lightest(Hx, Hz; trials = 400, seed = 0)
     w_t, s_t = _search_lightest_threaded(Hx, Hz; trials = 400, seed = 0, nthreads = 1)
     @test w_s == w_t
     @test s_s == s_t
-    # When actually threaded, still deterministic (perms pre-generated, so equal)
     if Threads.nthreads() > 1
         d_thr = distance_rand_threaded(Hx, Hz; trials = 400, seed = 0, nthreads = Threads.nthreads())
         @test d_thr == d_serial
         w_thr, _ = _search_lightest_threaded(Hx, Hz; trials = 400, seed = 0, nthreads = Threads.nthreads())
         @test w_thr == w_s
     end
-    # CSSCode overload
     c = CSSCode(Hx, Hz)
     @test distance_rand_threaded(c; trials = 400, seed = 0, nthreads = 1) == d_serial
 end
@@ -662,15 +805,81 @@ end
     @test d >= 1 && d <= 72
 end
 
+@testitem "surrogate: bitset LO parity matches dense on [[72,12,6]] and [[288,12,18]]" begin
+    for (l,m) in [(6,6),(12,12)]
+        Hx, Hz = build_bb(l, m, [(3, 0), (0, 1), (0, 2)], [(0, 3), (1, 0), (2, 0)])
+        # for 12,12 use the 288 params per task when available, else fallback to same polys with larger l/m
+        # task's 288 uses [(3,0),(0,2),(0,7)] / [(0,3),(1,0),(2,0)] — test both constructions but at least one
+        # we test current polys; second iteration tests the 288 specific polys
+        for (Ax,Az) in [ ([(3,0),(0,1),(0,2)], [(0,3),(1,0),(2,0)]), ([(3,0),(0,2),(0,7)], [(0,3),(1,0),(2,0)]) ]
+            # only valid combos: for 6,6 the second poly set still valid; for 12,12 both valid
+            Hx2, Hz2 = build_bb(l, m, Ax, Az)
+            n = size(Hx2,2)
+            # build kernel and logicals via same helpers used in search
+            Hx2_b = Matrix{Bool}(Hx2); Hz2_b = Matrix{Bool}(Hz2)
+            # test both sides
+            for (Hself_b, Hopp_b) in [(Hx2_b, Hz2_b), (Hz2_b, Hx2_b)]
+                K = kernel_basis(Hopp_b)
+                LO = logical_basis(Hself_b, Hopp_b)
+                size(K,1)==0 || size(LO,1)==0 && continue
+                nwords = QLDPC._nwords(n)
+                K_bits = QLDPC._bool_to_bitset(K)
+                LO_bits = QLDPC._bool_to_bitset(LO)
+                # sample a few deterministic perms and compare weights + masks
+                rng = MersenneTwister(0)
+                for _ in 1:3
+                    perm = randperm(rng, n)
+                    # dense RREF
+                    R = QLDPC._rref_perm_dense(K, perm)
+                    if size(R,1)==0; continue; end
+                    w_dense = vec(sum(R; dims=2))
+                    mz_dense = QLDPC._nontrivial_mask(R, LO)
+                    # bitset RREF
+                    B = QLDPC._bool_to_bitset(K)
+                    keep = QLDPC.rref_bitset!(B, n, perm)
+                    nk = length(keep)
+                    @test nk == size(R,1)
+                    w_bit = Vector{Int}(undef, nk)
+                    QLDPC._weights_bitset!(w_bit, B, keep, nwords)
+                    # compare weights (order may differ due to RREF keeping same rows but permuted? R rows are sorted by original order filtered; bitset keep same order)
+                    # both keep rows in increasing original index order filtered, so weights should match elementwise up to permutation
+                    # sort both for comparison since row order could be same — we compare sorted weights
+                    @test sort(w_dense) == sort(w_bit)
+                    # nontrivial masks sorted similarly
+                    mask_bit = Vector{Bool}(undef, nk)
+                    QLDPC._nontrivial_mask_bitset!(mask_bit, B, keep, LO_bits, nwords)
+                    # dense mask sorted vs bitset mask: need to match per weight? Instead verify parity per row matches by checking that multiset of (weight,mask) pairs equal
+                    pairs_dense = sort(collect(zip(w_dense, mz_dense)))
+                    pairs_bit = sort(collect(zip(w_bit, mask_bit)))
+                    @test pairs_dense == pairs_bit
+                    # also verify bitwise full mask equality when rows correspond
+                    # For stronger check, test that bitset mask equals dense mask when rows aligned by weight-stable? Just at least number of nontrivial matches
+                    @test count(identity, mz_dense) == count(identity, mask_bit)
+                    # pairwise spot-check: take two lightest rows and compare pairwise nontrivial
+                    if nk >= 2
+                        order_dense = sortperm(w_dense)[1:min(2,nk)]
+                        order_bit = sortperm(w_bit)[1:min(2,nk)]
+                        # dense pairwise
+                        pr_dense = R[order_dense[1],:] .⊻ R[order_dense[2],:]
+                        is_nz_dense = any(j -> isodd(count(pr_dense .& LO[j,:])), 1:size(LO,1))
+                        ri = keep[order_bit[1]]; rj = keep[order_bit[2]]
+                        is_nz_bit = QLDPC._pairwise_nontrivial_bitset(B, ri, rj, LO_bits, nwords)
+                        @test is_nz_dense == is_nz_bit
+                        pw_dense = count(identity, pr_dense)
+                        pw_bit = QLDPC._popcount_xor_rows(B, ri, rj, nwords)
+                        @test pw_dense == pw_bit
+                    end
+                end
+            end
+        end
+    end
+end
+
 @testitem "benchmark vs python" tags=[:benchmark] begin
-    # Filtered out of CI via `julia --project=. -e 'using TestItemRunner; @run_package_tests filter=ti->:benchmark ∉ ti.tags'`
-    # Run explicitly: `julia --project=. -e 'using TestItemRunner; @run_package_tests filter=ti->:benchmark ∈ ti.tags'`
     Hx, Hz = build_bb(6, 6, [(3, 0), (0, 1), (0, 2)], [(0, 3), (1, 0), (2, 0)])
-    # Just verify benchmark harness runs without error; timings not asserted
     t = @elapsed distance_rand(Hx, Hz; trials = 10, seed = 0)
     @test t < 5.0
     tt = @elapsed distance_rand_threaded(Hx, Hz; trials = 10, seed = 0, nthreads = 1)
     @test tt < 5.0
-    # Table print is in benchmark/bench_vs_python.jl — this item just guards the paths
     println("benchmark vs python smoke: serial $(round(t; digits=3))s threaded $(round(tt; digits=3))s")
 end
