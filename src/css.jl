@@ -168,16 +168,18 @@ function kernel_basis(H::AbstractMatrix)::Matrix{Bool}
 end
 
 """
-    logical_basis(Hself, Hopp) -> Matrix{Bool}
+    logical_basis(HX, HZ) -> Matrix{Bool}
 
-Z-type logical representatives: `ker(Hopp)` reduced modulo `rowspace(Hself)`.
-Mirror with `(Hz, Hx)` for the other type.
+Logical representatives: `ker(HX)` reduced modulo `rowspace(HZ)`.
+For HX=Hz, HZ=Hx this gives X-type; for HX=Hx, HZ=Hz this gives Z-type.
+Mirrors `verify/gf2.py:logical_basis` (Python: kernel of first arg, rowspace of second).
+Previously swapped (ker(Hopp) mod rowspace(Hself)) — fixed 2026-08-13 to match Python verifier.
 """
-function logical_basis(Hself::AbstractMatrix, Hopp::AbstractMatrix)::Matrix{Bool}
-    SZ, piv = rref_gf2(Hself)
+function logical_basis(HX::AbstractMatrix, HZ::AbstractMatrix)::Matrix{Bool}
+    SZ, piv = rref_gf2(HZ)
     piv = copy(piv)
     out = Vector{Vector{Bool}}()
-    for v in eachrow(kernel_basis(Hopp))
+    for v in eachrow(kernel_basis(HX))
         vv = Vector{Bool}(collect(v))
         for (i, p) in enumerate(piv)
             if vv[p]
@@ -193,7 +195,7 @@ function logical_basis(Hself::AbstractMatrix, Hopp::AbstractMatrix)::Matrix{Bool
         end
     end
     if isempty(out)
-        return zeros(Bool, 0, size(Hself, 2))
+        return zeros(Bool, 0, size(HX, 2))
     else
         return Matrix{Bool}(reduce(vcat, [reshape(v, 1, :) for v in out]))
     end

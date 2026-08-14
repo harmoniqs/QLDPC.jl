@@ -23,7 +23,9 @@ using SparseArrays
     monomial_matrix(l, m, a, b) -> SparseMatrixCSC{Bool}
 
 Permutation matrix for x^a y^b on l*m qubits indexed q = i*m + j.
-M[p+1,q+1]=1 where p = ((i+a)%l)*m + ((j+b)%m).
+Python convention: x^a y^b = S_l^a ⊗ S_m^b with S[r,c]=1 iff c=(r+1)%r
+(kron orientation). Julia was previously transposed (M[p,q]=1 where
+p=shift(q)); fixed to M[q,p]=1 ⇒ `kron(Sl^a, Sm^b)` exactly.
 """
 function monomial_matrix(l::Int, m::Int, a::Int, b::Int)::SparseMatrixCSC{Bool,Int}
     N = l * m
@@ -36,8 +38,10 @@ function monomial_matrix(l::Int, m::Int, a::Int, b::Int)::SparseMatrixCSC{Bool,I
         i = div(q, m)
         j = mod(q, m)
         p = mod(i + a_mod, l) * m + mod(j + b_mod, m)
-        I[q+1] = p + 1
-        J[q+1] = q + 1
+        # Fixed orientation: row = q+1 (=i*m+j+1), col = p+1 (=shifted)
+        # Equals kron(Sl^a, Sm^b) with S[i,(i+1)%r]=1 — verified vs Python 2026-08-13
+        I[q+1] = q + 1
+        J[q+1] = p + 1
     end
     return sparse(I, J, V, N, N)
 end
@@ -46,6 +50,7 @@ end
     poly_matrix(l, m, terms) -> SparseMatrixCSC{Bool}
 
 Sum (mod 2) of monomials for `terms = [(a,b), ...]`.
+Fused, sparse-only XOR — no dense Matrix convert.
 """
 function poly_matrix(
     l::Int,
@@ -53,16 +58,27 @@ function poly_matrix(
     terms::Vector{Tuple{Int,Int}},
 )::SparseMatrixCSC{Bool,Int}
     N = l * m
-    M = spzeros(Bool, N, N)
+    # Fused assembly: toggle entries in a Dict, then one sparse() call.
+    # Avoids per-term monomial_matrix alloc + dense Matrix(M) .⊻ Matrix(Mm).
+    pos = Dict{Tuple{Int,Int},Bool}()
     for (a, b) in terms
-        Mm = monomial_matrix(l, m, a, b)
-        # XOR (mod 2 sum): M = M .⊻ Mm  but sparse — do via nz handling
-        # Simple: convert to dense for XOR at these sizes, then back to sparse
-        # For N≤144 this is free and avoids sparse xor edge cases
-        Md = Matrix(M) .⊻ Matrix(Mm)
-        M = sparse(Md)
+        a_mod = mod(a, l)
+        b_mod = mod(b, m)
+        for q = 0:N-1
+            i = div(q, m)
+            j = mod(q, m)
+            p = mod(i + a_mod, l) * m + mod(j + b_mod, m)
+            key = (q + 1, p + 1)  # row=q+1, col=p+1 (matches fixed monomial)
+            pos[key] = !get(pos, key, false)
+        end
     end
-    return M
+    I = Vector{Int}(); J = Vector{Int}()
+    sizehint!(I, length(pos)); sizehint!(J, length(pos))
+    for (k, v) in pos
+        v || continue
+        push!(I, k[1]); push!(J, k[2])
+    end
+    return sparse(I, J, fill(true, length(I)), N, N)
 end
 
 # Convenience overload for Vector{Vector{Int}} or other tuple shapes
@@ -85,10 +101,11 @@ function build_bb(
     A = poly_matrix(l, m, A_terms)
     B = poly_matrix(l, m, B_terms)
     Hx = hcat(A, B)
-    Hz = hcat(sparse(Matrix(B)'), sparse(Matrix(A)'))
-    # ensure Bool
-    Hx = SparseMatrixCSC{Bool,Int}(Hx)
-    Hz = SparseMatrixCSC{Bool,Int}(Hz)
+    # Sparse transpose only — avoids Matrix(B) dense convert (was Matrix(B)')
+    Hz = hcat(transpose(B), transpose(A))
+    # ensure Bool CSC (transpose returns Transpose wrapper)
+    Hx = SparseMatrixCSC{Bool,Int}(sparse(Hx))
+    Hz = SparseMatrixCSC{Bool,Int}(sparse(Hz))
     return Hx, Hz
 end
 
