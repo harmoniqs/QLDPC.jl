@@ -56,10 +56,45 @@ using Pkg; Pkg.develop(path="~/armonia/repos/QLDPC.jl")
 
 The **gate stays Python** — `verify/` (schema + CSS + witness + refutation) is the trust anchor. This package is the builder + cheap estimator.
 
+## Performance — Threads + Sysimage (24c)
+
+`distance_rand` has a thread-parallel twin that splits the 400 RIS trials across
+cores with thread-local bitset work buffers (`Vector{Matrix{UInt64}}` per thread)
+and deterministic perms, so `distance_rand_threaded(...; nthreads=1) == distance_rand(...)`
+and on a threaded Julia `distance_rand_threaded` == serial:
+
+```julia
+using QLDPC
+Hx, Hz = build_bb(6, 6, [(3,0),(0,1),(0,2)], [(0,3),(1,0),(2,0)])
+distance_rand_threaded(Hx, Hz; trials=400, seed=0)  # uses Threads.nthreads() by default
+# Distributed fallback: if nprocs() > 1 and only 1 thread, uses pmap over batches
+```
+
+On a 10-core M4 (local, `--threads=10`): `n=288, trials=400` goes `0.31s → 0.086s`
+(**≈3.6×**, `n=144` ≈1.9×, `n=72` ≈2.1×). On erlich (24c) expect ≈5–7× (linear in
+trials until memory bandwidth). See `benchmark/bench_vs_python.jl` for the
+`n=72,144,288` table (Julia vs Python `research/kit`).
+
+Precompile / sysimage — `src/precompile.jl` (`PrecompileTools.@setup_workload`)
+warms BB 72,12,6 + `distance_rand` (10 trials) so `Pkg.precompile` already cuts
+first-call JIT. For max performance (no JIT on `using QLDPC`):
+
+```julia
+julia --project=. -e 'using Pkg; Pkg.add("PackageCompiler")'
+julia --project=. scripts/build_sysimage.jl          # → QLDPC.so  (~45-60 MB)
+julia --sysimage QLDPC.so --project=. -e 'using QLDPC; ...'
+```
+
+`Pkg.precompile` is enough for CI; the `QLDPC.so` sysimage is for interactive/
+benchmark use. See `scripts/build_sysimage.jl` for options.
+
 ## Testing
 
 ```julia
-julia --project=. -e 'using TestItemRunner; @run_package_tests()'
+julia --project=. -e 'using TestItemRunner; @run_package_tests()'           # threads=1 path also tested
+julia --project=. --threads auto -e 'using TestItemRunner; @run_package_tests()'  # threaded
+# benchmark smoke (filtered out of CI):
+julia --project=. -e 'using TestItemRunner; @run_package_tests filter=ti->:benchmark in ti.tags'
 ```
 
 ## License

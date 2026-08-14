@@ -26,6 +26,11 @@ docs/src/assets/
 # Manifests: track main package Manifest for reproducibility, ignore docs Manifest
 docs/Manifest.toml
 
+# Sysimage (PackageCompiler)
+QLDPC.so
+*.so
+*.dylib
+
 # Project specific ignores
 pardiso.lic
 /.CondaPkg/
