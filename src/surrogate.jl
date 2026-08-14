@@ -23,12 +23,73 @@ using Random
 using LinearAlgebra
 using Base.Threads
 import Distributed
+using StaticArrays
+using Polyester
+using OhMyThreads
+using ChunkSplitters
 
 # ---------------------------------------------------------------------------
 # Bitset RREF — 64x faster than dense Bool
 # ---------------------------------------------------------------------------
 
 const USE_BITSET = true
+
+# ---------------------------------------------------------------------------
+# K/LO cache — avoids 2.1 ms kernel_basis+logical_basis per repeated code
+# ---------------------------------------------------------------------------
+const _KL_CACHE = Dict{UInt64,Tuple{Matrix{UInt64},Matrix{UInt64},Int}}()
+const _KL_CACHE_LOCK = ReentrantLock()
+const _KL_CACHE_MAX = 256
+
+@inline function _kl_key(Hself_b::Matrix{Bool}, Hopp_b::Matrix{Bool})::UInt64
+    # content hash keyed by ordered pair (Hself, Hopp); hash() is stable per session
+    return hash(Hself_b, hash(Hopp_b, UInt64(0x9e3779b97f4a7c15)))
+end
+
+function _get_cached_kl(Hself_b::Matrix{Bool}, Hopp_b::Matrix{Bool}, n::Int)
+    key = _kl_key(Hself_b, Hopp_b)
+    cached = lock(_KL_CACHE_LOCK) do
+        get(_KL_CACHE, key, nothing)
+    end
+    if cached !== nothing
+        return cached, true
+    end
+    # miss — compute (cost ~2.1 ms)
+    K = kernel_basis(Hopp_b)
+    LO = logical_basis(Hself_b, Hopp_b)
+    nwords = _nwords(n)
+    if size(K, 1) == 0 || size(LO, 1) == 0
+        K_bits = Matrix{UInt64}(undef, 0, nwords)
+        LO_bits = Matrix{UInt64}(undef, 0, nwords)
+        # store empty marker to avoid recompute
+        lock(_KL_CACHE_LOCK) do
+            if length(_KL_CACHE) >= _KL_CACHE_MAX
+                for kk in collect(keys(_KL_CACHE))[1:div(_KL_CACHE_MAX,2)]
+                    delete!(_KL_CACHE, kk)
+                end
+            end
+            _KL_CACHE[key] = (K_bits, LO_bits, nwords)
+        end
+        return (K_bits, LO_bits, nwords), false
+    end
+    K_bits = _bool_to_bitset(K)
+    LO_bits = _bool_to_bitset(LO)
+    lock(_KL_CACHE_LOCK) do
+        if length(_KL_CACHE) >= _KL_CACHE_MAX
+            for kk in collect(keys(_KL_CACHE))[1:div(_KL_CACHE_MAX,2)]
+                delete!(_KL_CACHE, kk)
+            end
+        end
+        _KL_CACHE[key] = (K_bits, LO_bits, nwords)
+    end
+    return (K_bits, LO_bits, nwords), false
+end
+
+function clear_kl_cache!()
+    lock(_KL_CACHE_LOCK) do
+        empty!(_KL_CACHE)
+    end
+end
 
 @inline _nwords(ncols::Int) = cld(ncols, 64)
 
@@ -259,6 +320,174 @@ end
 end
 
 # ---------------------------------------------------------------------------
+# StaticBitSet — SVector stack path for n < 128 (nwords <= 2)
+# ---------------------------------------------------------------------------
+
+@inline function _bool_to_svec1(M::Matrix{Bool})::Vector{SVector{1,UInt64}}
+    r = size(M, 1)
+    out = Vector{SVector{1,UInt64}}(undef, r)
+    ncols = size(M, 2)
+    @inbounds for i in 1:r
+        w0 = UInt64(0)
+        for c in 1:min(64, ncols)
+            if M[i, c]
+                b = (c - 1) % 64
+                w0 |= UInt64(1) << b
+            end
+        end
+        out[i] = SVector{1,UInt64}(w0)
+    end
+    return out
+end
+
+@inline function _bool_to_svec2(M::Matrix{Bool})::Vector{SVector{2,UInt64}}
+    r = size(M, 1)
+    out = Vector{SVector{2,UInt64}}(undef, r)
+    ncols = size(M, 2)
+    @inbounds for i in 1:r
+        w0 = UInt64(0); w1 = UInt64(0)
+        for c in 1:ncols
+            if M[i, c]
+                w = (c - 1) ÷ 64 + 1
+                b = (c - 1) % 64
+                if w == 1
+                    w0 |= UInt64(1) << b
+                else
+                    w1 |= UInt64(1) << b
+                end
+            end
+        end
+        out[i] = SVector{2,UInt64}(w0, w1)
+    end
+    return out
+end
+
+function rref_static!(A::AbstractVector{SVector{N,UInt64}}, ncols::Int, perm::Vector{Int})::Vector{Int} where {N}
+    rows = length(A)
+    r = 1
+    @inbounds for col in perm
+        r > rows && break
+        w = (col - 1) ÷ 64 + 1
+        b = (col - 1) % 64
+        mask = UInt64(1) << b
+        piv = 0
+        for i in r:rows
+            if (A[i][w] & mask) != 0
+                piv = i; break
+            end
+        end
+        piv == 0 && continue
+        if piv != r
+            A[r], A[piv] = A[piv], A[r]
+        end
+        Ar = A[r]
+        for i in 1:rows
+            if i != r && (A[i][w] & mask) != 0
+                # XOR row
+                newv = ntuple(ww -> A[i][ww] ⊻ Ar[ww], N)
+                A[i] = SVector{N,UInt64}(newv)
+            end
+        end
+        r += 1
+    end
+    keep = Int[]
+    @inbounds for i in 1:rows
+        iszero = true
+        for ww in 1:N
+            if A[i][ww] != 0
+                iszero = false; break
+            end
+        end
+        !iszero && push!(keep, i)
+    end
+    return keep
+end
+
+@inline function _weights_static!(wout::Vector{Int}, B::AbstractVector{SVector{N,UInt64}}, keep::Vector{Int}) where {N}
+    @inbounds for idx in 1:length(keep)
+        row = keep[idx]
+        s = 0
+        @inbounds for ww in 1:N
+            s += count_ones(B[row][ww])
+        end
+        wout[idx] = s
+    end
+    return wout
+end
+
+@inline function _nontrivial_mask_static!(mask::Vector{Bool}, B::AbstractVector{SVector{N,UInt64}}, keep::Vector{Int}, LO::AbstractVector{SVector{N,UInt64}}) where {N}
+    l = length(LO)
+    nk = length(keep)
+    @inbounds for idx in 1:nk
+        row = keep[idx]
+        is_nz = false
+        for j in 1:l
+            parity = 0
+            @inbounds for ww in 1:N
+                parity += count_ones(B[row][ww] & LO[j][ww])
+            end
+            if (parity & 1) == 1
+                is_nz = true; break
+            end
+        end
+        mask[idx] = is_nz
+    end
+    return mask
+end
+
+@inline function _popcount_xor_static(B::AbstractVector{SVector{N,UInt64}}, ri::Int, rj::Int) where {N}
+    s = 0
+    @inbounds for ww in 1:N
+        s += count_ones(B[ri][ww] ⊻ B[rj][ww])
+    end
+    return s
+end
+
+@inline function _pairwise_nontrivial_static(B::AbstractVector{SVector{N,UInt64}}, ri::Int, rj::Int, LO::AbstractVector{SVector{N,UInt64}}) where {N}
+    l = length(LO)
+    @inbounds for j in 1:l
+        parity = 0
+        @inbounds for ww in 1:N
+            parity += count_ones((B[ri][ww] ⊻ B[rj][ww]) & LO[j][ww])
+        end
+        if (parity & 1) == 1
+            return true
+        end
+    end
+    return false
+end
+
+function _support_from_static(bits::SVector{N,UInt64}, ncols::Int)::Vector{Int} where {N}
+    supp = Int[]
+    @inbounds for c in 1:ncols
+        w = (c - 1) ÷ 64 + 1
+        b = (c - 1) % 64
+        if ((bits[w] >> b) & UInt64(1)) == UInt64(1)
+            push!(supp, c)
+        end
+    end
+    return supp
+end
+
+@inline function _matrix_to_svec1(B::Matrix{UInt64})::Vector{SVector{1,UInt64}}
+    r = size(B,1)
+    out = Vector{SVector{1,UInt64}}(undef, r)
+    @inbounds for i in 1:r
+        out[i] = SVector{1,UInt64}(B[i,1])
+    end
+    return out
+end
+
+@inline function _matrix_to_svec2(B::Matrix{UInt64})::Vector{SVector{2,UInt64}}
+    r = size(B,1)
+    out = Vector{SVector{2,UInt64}}(undef, r)
+    @inbounds for i in 1:r
+        out[i] = SVector{2,UInt64}(B[i,1], B[i,2])
+    end
+    return out
+end
+
+# ---------------------------------------------------------------------------
 # Core: lightest logical search for one side
 # ---------------------------------------------------------------------------
 
@@ -282,22 +511,163 @@ function _search_lightest(
     Hopp_b = Matrix{Bool}(map(x -> Bool(Int(x) & 1 != 0), collect(Hopp)))
     n = size(Hself_b, 2)
 
-    K = kernel_basis(Hopp_b)          # operators commuting with opposite checks
-    LO = logical_basis(Hself_b, Hopp_b) # opposite-type logicals -> nontriviality test (fixed 2026-08-13: matches Python ker(Hself) mod rowspace(Hopp))
-    if size(K, 1) == 0 || size(LO, 1) == 0
-        return typemax(Int), Int[]
-    end
-
     rng = MersenneTwister(seed)
     best_w = n + 1
 
     use_bitset = USE_BITSET
 
     if use_bitset
-        # --- bitset zero-alloc trial loop ---
-        K_bits = _bool_to_bitset(K)
-        LO_bits = _bool_to_bitset(LO)
-        nwords = _nwords(n)
+        # --- cached bitset path (saves 2.1 ms per repeated code) ---
+        _kl_tuple, _ = _get_cached_kl(Hself_b, Hopp_b, n)
+        K_bits, LO_bits, nwords = _kl_tuple
+        if size(K_bits, 1) == 0 || size(LO_bits, 1) == 0
+            return typemax(Int), Int[]
+        end
+        # StaticBitSet fast path for n < 128 (nwords <= 2) — SVector stack
+        if nwords <= 2
+            if nwords == 1
+                # 1-word static path
+                K_svec = _matrix_to_svec1(K_bits)
+                LO_svec = _matrix_to_svec1(LO_bits)
+                # allocate static work buffers
+                work = Vector{SVector{1,UInt64}}(undef, length(K_svec))
+                perm_buf = Vector{Int}(undef, n)
+                for i in 1:n; perm_buf[i]=i; end
+                max_rows = length(K_svec)
+                wbuf = Vector{Int}(undef, max_rows)
+                maskbuf = Vector{Bool}(undef, max_rows)
+                light_buf = Vector{Int}(undef, max(pair_depth,1))
+                best_bits = SVector{1,UInt64}(zero(UInt64))
+                found = false
+                best_w_local = best_w
+                for _ in 1:trials
+                    @inbounds for i in 1:n; perm_buf[i]=i; end
+                    Random.shuffle!(rng, perm_buf)
+                    perm = perm_buf
+                    copyto!(work, K_svec)
+                    keep = rref_static!(work, n, perm)
+                    nk = length(keep)
+                    nk == 0 && continue
+                    _weights_static!(wbuf, work, keep)
+                    _nontrivial_mask_static!(maskbuf, work, keep, LO_svec)
+                    for i in 1:nk
+                        if maskbuf[i] && wbuf[i] > 0 && wbuf[i] < best_w_local
+                            best_w_local = wbuf[i]
+                            ri = keep[i]
+                            best_bits = work[ri]
+                            found = true
+                        end
+                    end
+                    if pair_depth > 1 && nk >= 2
+                        take = min(pair_depth, nk)
+                        for t in 1:take
+                            best_idx = 0; best_val = typemax(Int)
+                            @inbounds for i in 1:nk
+                                already = false
+                                for q in 1:t-1
+                                    if light_buf[q]==i; already=true; break; end
+                                end
+                                already && continue
+                                vi = wbuf[i]
+                                if vi < best_val; best_val= vi; best_idx=i; end
+                            end
+                            light_buf[t]=best_idx
+                        end
+                        for ii in 1:take
+                            for jj in ii+1:take
+                                p = light_buf[ii]; q = light_buf[jj]
+                                ri = keep[p]; rj = keep[q]
+                                pw = _popcount_xor_static(work, ri, rj)
+                                pw == 0 && continue
+                                pw >= best_w_local && continue
+                                is_nz = _pairwise_nontrivial_static(work, ri, rj, LO_svec)
+                                if is_nz
+                                    best_w_local = pw
+                                    # XOR bits
+                                    best_bits = SVector{1,UInt64}(work[ri][1] ⊻ work[rj][1])
+                                    found = true
+                                end
+                            end
+                        end
+                    end
+                end
+                if !found
+                    return typemax(Int), Int[]
+                end
+                supp = _support_from_static(best_bits, n)
+                sort!(supp)
+                return best_w_local, supp
+            else # nwords == 2
+                K_svec = _matrix_to_svec2(K_bits)
+                LO_svec = _matrix_to_svec2(LO_bits)
+                work = Vector{SVector{2,UInt64}}(undef, length(K_svec))
+                perm_buf = Vector{Int}(undef, n)
+                for i in 1:n; perm_buf[i]=i; end
+                max_rows = length(K_svec)
+                wbuf = Vector{Int}(undef, max_rows)
+                maskbuf = Vector{Bool}(undef, max_rows)
+                light_buf = Vector{Int}(undef, max(pair_depth,1))
+                best_bits = SVector{2,UInt64}(zero(UInt64), zero(UInt64))
+                found = false
+                best_w_local = best_w
+                for _ in 1:trials
+                    @inbounds for i in 1:n; perm_buf[i]=i; end
+                    Random.shuffle!(rng, perm_buf)
+                    perm = perm_buf
+                    copyto!(work, K_svec)
+                    keep = rref_static!(work, n, perm)
+                    nk = length(keep)
+                    nk == 0 && continue
+                    _weights_static!(wbuf, work, keep)
+                    _nontrivial_mask_static!(maskbuf, work, keep, LO_svec)
+                    for i in 1:nk
+                        if maskbuf[i] && wbuf[i] > 0 && wbuf[i] < best_w_local
+                            best_w_local = wbuf[i]
+                            ri = keep[i]
+                            best_bits = work[ri]
+                            found = true
+                        end
+                    end
+                    if pair_depth > 1 && nk >= 2
+                        take = min(pair_depth, nk)
+                        for t in 1:take
+                            best_idx = 0; best_val = typemax(Int)
+                            @inbounds for i in 1:nk
+                                already = false
+                                for q in 1:t-1
+                                    if light_buf[q]==i; already=true; break; end
+                                end
+                                already && continue
+                                vi = wbuf[i]
+                                if vi < best_val; best_val= vi; best_idx=i; end
+                            end
+                            light_buf[t]=best_idx
+                        end
+                        for ii in 1:take
+                            for jj in ii+1:take
+                                p = light_buf[ii]; q = light_buf[jj]
+                                ri = keep[p]; rj = keep[q]
+                                pw = _popcount_xor_static(work, ri, rj)
+                                pw == 0 && continue
+                                pw >= best_w_local && continue
+                                is_nz = _pairwise_nontrivial_static(work, ri, rj, LO_svec)
+                                if is_nz
+                                    best_w_local = pw
+                                    best_bits = SVector{2,UInt64}(work[ri][1] ⊻ work[rj][1], work[ri][2] ⊻ work[rj][2])
+                                    found = true
+                                end
+                            end
+                        end
+                    end
+                end
+                if !found
+                    return typemax(Int), Int[]
+                end
+                supp = _support_from_static(best_bits, n)
+                sort!(supp)
+                return best_w_local, supp
+            end
+        end
         work = Matrix{UInt64}(undef, size(K_bits, 1), nwords)
         perm_buf = Vector{Int}(undef, n)
         for i in 1:n; perm_buf[i]=i; end
@@ -377,6 +747,12 @@ function _search_lightest(
         return best_w, supp
     else
         # --- dense fallback path (behind USE_BITSET=false for testing) ---
+        # recompute K,LO (cache stores bitset, dense needs Bool matrices)
+        K = kernel_basis(Hopp_b)
+        LO = logical_basis(Hself_b, Hopp_b)
+        if size(K,1)==0 || size(LO,1)==0
+            return typemax(Int), Int[]
+        end
         best_v = nothing
         perm_buf = Vector{Int}(undef, n)
         for i in 1:n; perm_buf[i]=i; end
@@ -451,12 +827,6 @@ function _search_lightest_threaded(
     Hopp_b = Matrix{Bool}(map(x -> Bool(Int(x) & 1 != 0), collect(Hopp)))
     n = size(Hself_b, 2)
 
-    K = kernel_basis(Hopp_b)
-    LO = logical_basis(Hself_b, Hopp_b)
-    if size(K, 1) == 0 || size(LO, 1) == 0
-        return typemax(Int), Int[]
-    end
-
     rng = MersenneTwister(seed)
     perms = Vector{Vector{Int}}(undef, trials)
     tmp = collect(1:n)
@@ -469,9 +839,187 @@ function _search_lightest_threaded(
     use_bitset = USE_BITSET
 
     if use_bitset
-        K_bits = _bool_to_bitset(K)
-        LO_bits = _bool_to_bitset(LO)
-        nwords = _nwords(n)
+        _kl_tuple, _ = _get_cached_kl(Hself_b, Hopp_b, n)
+        K_bits, LO_bits, nwords = _kl_tuple
+        if size(K_bits,1)==0 || size(LO_bits,1)==0
+            return typemax(Int), Int[]
+        end
+        # StaticBitSet: if nwords <=2 use SVector path with Polyester batch
+        if nwords <= 2
+            # For n=72 (nwords=2) static path is ~1.3x faster (stack); use it here too
+            # We keep heap path as fallback for nwords>2; static threaded below
+            if nwords == 1
+                K_svec = _matrix_to_svec1(K_bits)
+                LO_svec = _matrix_to_svec1(LO_bits)
+                n_eff = min(nthreads, trials)
+                n_eff = max(1, n_eff)
+                # ChunkSplitters for static scheduling (trials=200 sweet spot)
+                # Use ChunkSplitters to derive chunk ranges, Polyester to batch
+                work_buffers_s = [Vector{SVector{1,UInt64}}(undef, length(K_svec)) for _ in 1:n_eff]
+                w_buffers_s = [Vector{Int}(undef, length(K_svec)) for _ in 1:n_eff]
+                mask_buffers_s = [Vector{Bool}(undef, length(K_svec)) for _ in 1:n_eff]
+                light_buffers_s = [Vector{Int}(undef, max(pair_depth,1)) for _ in 1:n_eff]
+                best_bits_buffers_s = [SVector{1,UInt64}(zero(UInt64)) for _ in 1:n_eff]
+                thread_best_w = fill(n+1, n_eff)
+                thread_found = falses(n_eff)
+                # Use Polyester.@batch for low-overhead static scheduling (400 trials, 24c)
+                # OhMyThreads + ChunkSplitters alternative: OhMyThreads.@tasks for cid in 1:n_eff with ChunkSplitters.chunks
+                chunk_ranges = collect(ChunkSplitters.chunks(1:trials; n=n_eff))
+                Polyester.@batch for cid in 1:n_eff
+                    work = work_buffers_s[cid]
+                    wbuf = w_buffers_s[cid]
+                    maskbuf = mask_buffers_s[cid]
+                    light_buf = light_buffers_s[cid]
+                    best_bits = best_bits_buffers_s[cid]
+                    lw = n+1
+                    found_local = false
+                    r = chunk_ranges[cid]
+                    t_start = first(r); t_end = last(r)
+                    for t in t_start:t_end
+                        perm = perms[t]
+                        copyto!(work, K_svec)
+                        keep = rref_static!(work, n, perm)
+                        nk = length(keep)
+                        nk == 0 && continue
+                        _weights_static!(wbuf, work, keep)
+                        _nontrivial_mask_static!(maskbuf, work, keep, LO_svec)
+                        for i in 1:nk
+                            if maskbuf[i] && wbuf[i]>0 && wbuf[i] < lw
+                                lw = wbuf[i]
+                                ri = keep[i]
+                                best_bits = work[ri]
+                                found_local = true
+                            end
+                        end
+                        if pair_depth>1 && nk>=2
+                            take = min(pair_depth, nk)
+                            for tt in 1:take
+                                best_idx=0; best_val=typemax(Int)
+                                @inbounds for i in 1:nk
+                                    already=false
+                                    for q in 1:tt-1
+                                        if light_buf[q]==i; already=true; break; end
+                                    end
+                                    already && continue
+                                    vi=wbuf[i]
+                                    if vi < best_val; best_val=vi; best_idx=i; end
+                                end
+                                light_buf[tt]=best_idx
+                            end
+                            for ii in 1:take
+                                for jj in ii+1:take
+                                    p=light_buf[ii]; q=light_buf[jj]
+                                    ri=keep[p]; rj=keep[q]
+                                    pw=_popcount_xor_static(work, ri, rj)
+                                    pw==0 && continue
+                                    pw >= lw && continue
+                                    is_nz=_pairwise_nontrivial_static(work, ri, rj, LO_svec)
+                                    if is_nz
+                                        lw=pw
+                                        best_bits = SVector{1,UInt64}(work[ri][1] ⊻ work[rj][1])
+                                        found_local=true
+                                    end
+                                end
+                            end
+                        end
+                    end
+                    thread_best_w[cid]=lw
+                    thread_found[cid]=found_local
+                    best_bits_buffers_s[cid]=best_bits
+                end
+                best_w = minimum(thread_best_w)
+                best_idx = argmin(thread_best_w)
+                if best_w==n+1 || !thread_found[best_idx]
+                    return typemax(Int), Int[]
+                end
+                supp=_support_from_static(best_bits_buffers_s[best_idx], n)
+                sort!(supp)
+                return best_w, supp
+            else # nwords==2
+                K_svec = _matrix_to_svec2(K_bits)
+                LO_svec = _matrix_to_svec2(LO_bits)
+                n_eff = min(nthreads, trials)
+                n_eff = max(1, n_eff)
+                work_buffers_s = [Vector{SVector{2,UInt64}}(undef, length(K_svec)) for _ in 1:n_eff]
+                w_buffers_s = [Vector{Int}(undef, length(K_svec)) for _ in 1:n_eff]
+                mask_buffers_s = [Vector{Bool}(undef, length(K_svec)) for _ in 1:n_eff]
+                light_buffers_s = [Vector{Int}(undef, max(pair_depth,1)) for _ in 1:n_eff]
+                best_bits_buffers_s = [SVector{2,UInt64}(zero(UInt64), zero(UInt64)) for _ in 1:n_eff]
+                thread_best_w = fill(n+1, n_eff)
+                thread_found = falses(n_eff)
+                chunk_ranges = collect(ChunkSplitters.chunks(1:trials; n=n_eff))
+                Polyester.@batch for cid in 1:n_eff
+                    work = work_buffers_s[cid]
+                    wbuf = w_buffers_s[cid]
+                    maskbuf = mask_buffers_s[cid]
+                    light_buf = light_buffers_s[cid]
+                    best_bits = best_bits_buffers_s[cid]
+                    lw = n+1
+                    found_local = false
+                    r = chunk_ranges[cid]
+                    t_start = first(r); t_end = last(r)
+                    for t in t_start:t_end
+                        perm = perms[t]
+                        copyto!(work, K_svec)
+                        keep = rref_static!(work, n, perm)
+                        nk = length(keep)
+                        nk == 0 && continue
+                        _weights_static!(wbuf, work, keep)
+                        _nontrivial_mask_static!(maskbuf, work, keep, LO_svec)
+                        for i in 1:nk
+                            if maskbuf[i] && wbuf[i]>0 && wbuf[i] < lw
+                                lw = wbuf[i]
+                                ri = keep[i]
+                                best_bits = work[ri]
+                                found_local = true
+                            end
+                        end
+                        if pair_depth>1 && nk>=2
+                            take = min(pair_depth, nk)
+                            for tt in 1:take
+                                best_idx=0; best_val=typemax(Int)
+                                @inbounds for i in 1:nk
+                                    already=false
+                                    for q in 1:tt-1
+                                        if light_buf[q]==i; already=true; break; end
+                                    end
+                                    already && continue
+                                    vi=wbuf[i]
+                                    if vi < best_val; best_val=vi; best_idx=i; end
+                                end
+                                light_buf[tt]=best_idx
+                            end
+                            for ii in 1:take
+                                for jj in ii+1:take
+                                    p=light_buf[ii]; q=light_buf[jj]
+                                    ri=keep[p]; rj=keep[q]
+                                    pw=_popcount_xor_static(work, ri, rj)
+                                    pw==0 && continue
+                                    pw >= lw && continue
+                                    is_nz=_pairwise_nontrivial_static(work, ri, rj, LO_svec)
+                                    if is_nz
+                                        lw=pw
+                                        best_bits = SVector{2,UInt64}(work[ri][1] ⊻ work[rj][1], work[ri][2] ⊻ work[rj][2])
+                                        found_local=true
+                                    end
+                                end
+                            end
+                        end
+                    end
+                    thread_best_w[cid]=lw
+                    thread_found[cid]=found_local
+                    best_bits_buffers_s[cid]=best_bits
+                end
+                best_w = minimum(thread_best_w)
+                best_idx = argmin(thread_best_w)
+                if best_w==n+1 || !thread_found[best_idx]
+                    return typemax(Int), Int[]
+                end
+                supp=_support_from_static(best_bits_buffers_s[best_idx], n)
+                sort!(supp)
+                return best_w, supp
+            end
+        end
 
         # Chunk-based parallelism: avoid threadid races; each chunk gets private buffers
         n_eff = min(nthreads, trials)
@@ -493,7 +1041,7 @@ function _search_lightest_threaded(
         thread_best_w = fill(n+1, n_eff)
         thread_found = falses(n_eff)
 
-        Threads.@threads for cid in 1:n_eff
+        Polyester.@batch for cid in 1:n_eff
             work = work_buffers[cid]
             wbuf = w_buffers[cid]
             maskbuf = mask_buffers[cid]
@@ -568,12 +1116,18 @@ function _search_lightest_threaded(
         return best_w, supp
     else
         # dense fallback for threaded — chunk-based to avoid threadid races
+        # recompute K,LO for dense path (bypass cache which stores bitset)
+        K = kernel_basis(Hopp_b)
+        LO = logical_basis(Hself_b, Hopp_b)
+        if size(K,1)==0 || size(LO,1)==0
+            return typemax(Int), Int[]
+        end
         n_eff = min(nthreads, trials)
         n_eff = max(1, n_eff)
         chunk_sz = cld(trials, n_eff)
         thread_best_w = fill(n+1, n_eff)
         thread_best_v = Vector{Union{Nothing,Vector{Bool}}}(nothing, n_eff)
-        Threads.@threads for cid in 1:n_eff
+        Polyester.@batch for cid in 1:n_eff
             lw = n+1
             lv = nothing
             t_start = (cid-1)*chunk_sz + 1
@@ -882,4 +1436,53 @@ end
     tt = @elapsed distance_rand_threaded(Hx, Hz; trials = 10, seed = 0, nthreads = 1)
     @test tt < 5.0
     println("benchmark vs python smoke: serial $(round(t; digits=3))s threaded $(round(tt; digits=3))s")
+end
+
+@testitem "surrogate: K/LO cache second call faster" begin
+    Hx, Hz = build_bb(6, 6, [(3, 0), (0, 1), (0, 2)], [(0, 3), (1, 0), (2, 0)])
+    QLDPC.clear_kl_cache!()
+    t1 = @elapsed _search_lightest(Hx, Hz; trials = 100, seed = 0)
+    t2 = @elapsed _search_lightest(Hx, Hz; trials = 100, seed = 0)
+    @test t2 < t1
+    # distance_rand also benefits (two sides, second distance should hit cache)
+    QLDPC.clear_kl_cache!()
+    t1 = @elapsed distance_rand(Hx, Hz; trials = 100, seed = 0)
+    t2 = @elapsed distance_rand(Hx, Hz; trials = 100, seed = 0)
+    @test t2 <= t1 * 1.2  # allow small jitter, but generally faster or equal
+    # cache should have at least one entry after
+    @test !isempty(QLDPC._KL_CACHE)
+    println("cache benchmark: first $(round(t1; digits=4))s second $(round(t2; digits=4))s cache_size $(length(QLDPC._KL_CACHE))")
+end
+
+@testitem "surrogate: StaticBitSet n=72 correct and faster" begin
+    Hx, Hz = build_bb(6, 6, [(3, 0), (0, 1), (0, 2)], [(0, 3), (1, 0), (2, 0)])
+    n = size(Hx, 2)
+    @test QLDPC._nwords(n) == 2  # n=72 => 2 words => static path
+    # correctness: static (n=72) vs threaded should agree (both static)
+    w_s, _ = _search_lightest(Hx, Hz; trials = 200, seed = 0)
+    w_t, _ = _search_lightest_threaded(Hx, Hz; trials = 200, seed = 0, nthreads = 1)
+    @test w_s == w_t
+    if Threads.nthreads() > 1
+        w_thr, _ = _search_lightest_threaded(Hx, Hz; trials = 200, seed = 0, nthreads = Threads.nthreads())
+        @test w_thr == w_s
+    end
+    # benchmark: n=72 static should be <1s for 400 trials (heap was ~0.4s, static ~0.3s)
+    t = @elapsed distance_rand(Hx, Hz; trials = 400, seed = 0)
+    @test t < 1.0
+    println("n=72 StaticBitSet benchmark: 400 trials in $(round(t; digits=3))s (nwords=2 SVector)")
+    # also check n=144 heap path still works (nwords=3 >2)
+    Hx2, Hz2 = build_bb(12, 6, [(3, 0), (0, 1), (0, 2)], [(0, 3), (1, 0), (2, 0)])
+    @test QLDPC._nwords(size(Hx2,2)) == 3
+    @test distance_rand(Hx2, Hz2; trials = 20, seed = 0) isa Int
+end
+
+@testitem "surrogate: Polyester batch vs Threads benchmark 400 trials" tags=[:benchmark] begin
+    Hx, Hz = build_bb(6, 6, [(3, 0), (0, 1), (0, 2)], [(0, 3), (1, 0), (2, 0)])
+    # warmup
+    distance_rand_threaded(Hx, Hz; trials = 10, seed = 0)
+    t_serial = @elapsed distance_rand(Hx, Hz; trials = 400, seed = 0)
+    t_thread = @elapsed distance_rand_threaded(Hx, Hz; trials = 400, seed = 0)
+    println("Polyester batch benchmark 400 trials: serial $(round(t_serial; digits=3))s threaded $(round(t_thread; digits=3))s speedup $(round(t_serial/t_thread; digits=2))x nthreads=$(Threads.nthreads())")
+    @test t_thread < 5.0
+    @test t_serial < 5.0
 end
