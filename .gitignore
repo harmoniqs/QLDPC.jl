@@ -19,7 +19,8 @@ docs/clones/
 docs/out/
 docs/src/generated/
 
-docs/src/assets/
+docs/src/assets/*
+!docs/src/assets/custom.css
 
 # Build artifact for using README as index
 
