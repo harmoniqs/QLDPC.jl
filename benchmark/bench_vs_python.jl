@@ -65,13 +65,33 @@ function time_python(l, m, A, B; trials=400, seed=0)
     b_str = string(B)
     # Python code: build_bb + surrogate.distance_rand
     code = """
-import time, sys
+import time, sys, os
+# candidate challenge roots (local checkout next to QLDPC.jl, erlich ~/qldpc-challenge, env QLDPC_CHALLENGE)
+_candidates = [
+    os.environ.get("QLDPC_CHALLENGE", ""),
+    os.path.join(os.getcwd(), "..", "qldpc-challenge"),
+    os.path.join(os.getcwd(), "..", "..", "qldpc-challenge"),
+    "/home/aaron/qldpc-challenge",
+    os.path.expanduser("~/armonia/repos/qldpc-challenge"),
+    os.path.expanduser("~/qldpc-challenge"),
+    ".",
+]
+for _r in _candidates:
+    if _r and os.path.isdir(_r):
+        for _sub in ["research/kit", "verify", ""]:
+            _p = os.path.join(_r, _sub) if _sub else _r
+            if _p not in sys.path:
+                sys.path.insert(0, _p)
 try:
     from research.kit.bb import build_bb
     from research.kit.surrogate import distance_rand
-except Exception as e:
-    print("PY_NA", e, file=sys.stderr)
-    sys.exit(0)
+except Exception:
+    try:
+        from bb import build_bb
+        from surrogate import distance_rand
+    except Exception as e:
+        print("PY_NA", e, file=sys.stderr)
+        sys.exit(0)
 for _ in range(1):
     Hx, Hz = build_bb($l, $m, $a_str, $b_str)
     distance_rand(Hx, Hz, trials=10, seed=$seed)

@@ -70,10 +70,44 @@ distance_rand_threaded(Hx, Hz; trials=400, seed=0)  # uses Threads.nthreads() by
 # Distributed fallback: if nprocs() > 1 and only 1 thread, uses pmap over batches
 ```
 
-On a 10-core M4 (local, `--threads=10`): `n=288, trials=400` goes `0.31s → 0.086s`
-(**≈3.6×**, `n=144` ≈1.9×, `n=72` ≈2.1×). On erlich (24c) expect ≈5–7× (linear in
-trials until memory bandwidth). See `benchmark/bench_vs_python.jl` for the
-`n=72,144,288` table (Julia vs Python `research/kit`).
+Measured on erlich (24c Alder Lake, Julia 1.12.5, `benchmark/bench_vs_python.jl` median of 3, trials=400):
+
+```
+# Julia vs Python — build_bb + distance_rand (trials=400)
+# Threads: 10, Julia 1.12.5, alderlake
+code           n    k      julia (s)    julia-thr(s) python (s)
+------------------------------------------------------------------------------
+[[72,12,6]]    72   12     0.017        0.004 (4.1x) 0.446
+[[144,12,12]]  144  12     0.049        0.011 (4.3x) 1.231
+[[288,12,18]]  288  12     0.181        0.043 (4.2x) 4.046
+
+# Threads: 24
+[[72,12,6]]    72   12     0.018        0.004 (4.2x) 0.441
+[[144,12,12]]  144  12     0.050        0.009 (5.7x) 1.223
+[[288,12,18]]  288  12     0.187        0.050 (3.7x) 4.107
+```
+
+`@belapsed` steady-state (BenchmarkTools, warmed, 24c):
+
+| n | serial | threaded (24c) | speedup |
+|---|---:|---:|---:|
+| 72 | 15.3 ms | 2.5 ms | 6.2× |
+| 144 | 48.6 ms | 7.0 ms | 7.0× |
+| 288 | 180.4 ms | 24.8 ms | 7.3× |
+
+Python `research/kit` (same RIS, numpy) is ~25× slower than Julia serial (`n=288`: 4.1s vs 0.18s) and ~150× slower than Julia threaded 24c (`n=288`: 4.1s vs 0.025s).
+
+For `n=288, trials=400` (`--threads=10`):
+
+```
+julia> @btime distance_rand($Hx,$Hz; trials=400)
+  180.624 ms (279134 allocations: 77.69 MiB)
+julia> @btime distance_rand_threaded($Hx,$Hz; trials=400)
+  36.949 ms (282304 allocations: 79.84 MiB)   # 10c
+  # 24c: 24.8 ms (7.3×)
+```
+
+Hunter: `examples/hunt_w6.jl` (`julia --threads=24 --project=. examples/hunt_w6.jl`) does the same `l,m 12..18 w6` sweep as `research/candidates/bb_unrestricted_w6.py` (TARGET 19.2) but with `distance_rand_threaded` — 500 codes in 10.9s on erlich vs 26s via the Python hunter's subprocess bridge and ~500s pure Python. See `benchmark/bench_vs_python.jl` and `examples/hunt_w6.jl`.
 
 Precompile / sysimage — `src/precompile.jl` (`PrecompileTools.@setup_workload`)
 warms BB 72,12,6 + `distance_rand` (10 trials) so `Pkg.precompile` already cuts
