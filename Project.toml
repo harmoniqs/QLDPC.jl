@@ -1,6 +1,6 @@
 name = "QLDPC"
 uuid = "9c9d2c0e-fc67-404e-a1d1-f48da30a9788"
-version = "0.2.0"
+version = "0.2.1"
 authors = ["Aaron Trowbridge <aaron@harmoniqs.co> and contributors"]
 
 [deps]
@@ -24,11 +24,9 @@ TestItems = "1c621080-faea-4a02-84b6-bbd5e436b8fe"
 
 [weakdeps]
 Nemo = "2edaba10-b0f1-5616-af89-8c11ac63239a"
-LDPCDecoders = "79938d04-85a8-4366-b89d-f4412d176368"
 
 [extensions]
 QLDPCNemoExt = "Nemo"
-QLDPCDecodeExt = "LDPCDecoders"
 
 [compat]
 Aqua = "0.8"
@@ -39,7 +37,6 @@ JLD2 = "0.6"
 JSON = "1"
 LinearAlgebra = "1.10, 1.11, 1.12"
 Nemo = "0.49, 0.50, 0.51, 0.52, 0.53, 0.54, 0.55, 0.56"
-LDPCDecoders = "0.1"
 OhMyThreads = "0.8.6"
 PackageCompiler = "2.2"
 Polyester = "0.7.19"
