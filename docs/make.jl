@@ -18,7 +18,7 @@ makedocs(;
     format = Documenter.HTML(;
         canonical = "https://harmoniqs.github.io/QLDPC.jl",
         edit_link = "main",
-        assets = String[],
+        assets = String["assets/custom.css"],
     ),
     pages = [
         "Home" => "index.md",
